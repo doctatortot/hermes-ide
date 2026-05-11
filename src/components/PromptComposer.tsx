@@ -438,10 +438,17 @@ export function PromptComposer({ sessionId, onClose, addToast }: PromptComposerP
       if (result.templatesAdded > 0) parts.push(t("builder.importedTemplates", { count: result.templatesAdded }));
       if (result.rolesAdded > 0) parts.push(t("builder.importedRoles", { count: result.rolesAdded }));
       if (result.stylesAdded > 0) parts.push(t("builder.importedStyles", { count: result.stylesAdded }));
+      const joinedParts = parts.join(", ");
+      // A renamed template is also a counted "added" one, so renamed > 0
+      // implies parts.length > 0 — no "nothing to import, but renamed" case.
       const msg = parts.length > 0
-        ? result.templatesSkipped > 0
-          ? t("builder.importedSummarySkipped", { parts: parts.join(", "), count: result.templatesSkipped })
-          : t("builder.importedSummary", { parts: parts.join(", ") })
+        ? result.templatesRenamed > 0 && result.templatesSkipped > 0
+          ? t("builder.importedSummaryRenamedSkipped", { parts: joinedParts, renamed: result.templatesRenamed, skipped: result.templatesSkipped })
+          : result.templatesRenamed > 0
+            ? t("builder.importedSummaryRenamed", { parts: joinedParts, count: result.templatesRenamed })
+            : result.templatesSkipped > 0
+              ? t("builder.importedSummarySkipped", { parts: joinedParts, count: result.templatesSkipped })
+              : t("builder.importedSummary", { parts: joinedParts })
         : result.templatesSkipped > 0
           ? t("builder.nothingToImportSkipped", { count: result.templatesSkipped })
           : t("builder.nothingToImport");
