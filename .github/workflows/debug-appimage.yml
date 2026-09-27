@@ -128,11 +128,11 @@ jobs:
           # against the app's real pubkey, which is fine since nothing
           # here is ever published or checked against it.
           npx tauri signer generate --ci -w /tmp/debug-signing.key -p ""
-          {
-            echo "TAURI_SIGNING_PRIVATE_KEY<<TAURI_KEY_EOF"
-            cat /tmp/debug-signing.key
-            echo "TAURI_KEY_EOF"
-          } >> "$GITHUB_ENV"
+          # For the `build`/`bundle` commands, TAURI_SIGNING_PRIVATE_KEY
+          # accepts a file path directly, so there's no need to inline
+          # the key content into $GITHUB_ENV (and no multiline-heredoc
+          # footgun to get wrong).
+          echo "TAURI_SIGNING_PRIVATE_KEY=/tmp/debug-signing.key" >> "$GITHUB_ENV"
           echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=" >> "$GITHUB_ENV"
 
       - name: Build AppImage with maximum verbosity
