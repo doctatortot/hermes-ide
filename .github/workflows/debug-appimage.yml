@@ -117,6 +117,24 @@ jobs:
           echo "=== largest files ==="
           find src-tauri/bridge/node_modules -type f -size +5M -exec ls -lh {} \; | head -20
 
+      - name: Generate ephemeral signing key for this debug run
+        run: |
+          set -e
+          # tauri.conf.json has a real updater pubkey configured, so the
+          # bundler insists on a private key to produce a .sig alongside
+          # the AppImage even though this debug workflow never publishes
+          # anything. A throwaway keypair generated fresh on this runner
+          # satisfies that check — the .sig it produces won't verify
+          # against the app's real pubkey, which is fine since nothing
+          # here is ever published or checked against it.
+          npx tauri signer generate --ci -w /tmp/debug-signing.key -p ""
+          {
+            echo "TAURI_SIGNING_PRIVATE_KEY<<TAURI_KEY_EOF"
+            cat /tmp/debug-signing.key
+            echo "TAURI_KEY_EOF"
+          } >> "$GITHUB_ENV"
+          echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=" >> "$GITHUB_ENV"
+
       - name: Build AppImage with maximum verbosity
         run: |
           set -x -o pipefail
