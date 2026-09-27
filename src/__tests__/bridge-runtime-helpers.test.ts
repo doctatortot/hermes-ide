@@ -17,6 +17,7 @@ import {
   createIdempotentLatch,
   createControlOpBuffer,
   toSdkUserMessage,
+  resolveRuntimeModuleSpecifier,
 } from "../../src-tauri/bridge/bridgeRuntimeHelpers.mjs";
 import { buildUserEnvelope } from "../utils/submitToAgent";
 
@@ -165,5 +166,82 @@ describe("toSdkUserMessage — SDK `origin` provenance", () => {
     const msg = toSdkUserMessage({ type: "user", message: {}, origin }, undefined);
     expect(msg.origin).toEqual(origin);
     expect("session_id" in msg).toBe(false);
+  });
+});
+
+/**
+ * `resolveRuntimeModuleSpecifier` — picks the `import()` specifier for an
+ * npm dep of the bridge (see docs/adr/002-bridge-runtime-tarball.md). In
+ * dev there's no `--bridge-runtime-dir`, so it must hand back the bare
+ * package name unchanged (Node resolves it from the bridge's own adjacent
+ * node_modules, exactly like the static imports it replaced). In
+ * production it must read the extracted runtime's manifest.json and
+ * build a `file://` URL to the package's recorded entry file — never a
+ * guess at a filename, since a package's `exports` map can change shape
+ * across versions (the SDK's did, 0.2.x → 0.3.x).
+ */
+describe("resolveRuntimeModuleSpecifier", () => {
+  it("returns the bare package name when no runtime dir is given (dev)", () => {
+    const io = {
+      readFileSync: vi.fn(),
+      pathToFileURL: vi.fn(),
+      join: vi.fn(),
+    };
+    const spec = resolveRuntimeModuleSpecifier(
+      "@anthropic-ai/claude-agent-sdk",
+      null,
+      io,
+    );
+    expect(spec).toBe("@anthropic-ai/claude-agent-sdk");
+    expect(io.readFileSync).not.toHaveBeenCalled();
+  });
+
+  it("reads manifest.json and builds a file:// URL from the recorded entry (production)", () => {
+    const manifest = {
+      entries: { "@anthropic-ai/claude-agent-sdk": "@anthropic-ai/claude-agent-sdk/sdk.mjs" },
+    };
+    const io = {
+      readFileSync: vi.fn((path: string) => {
+        expect(path).toBe("/runtime/0.3.283/manifest.json");
+        return JSON.stringify(manifest);
+      }),
+      pathToFileURL: vi.fn((p: string) => ({ href: `file://${p}` })),
+      join: vi.fn((...parts: string[]) => parts.join("/")),
+    };
+    const spec = resolveRuntimeModuleSpecifier(
+      "@anthropic-ai/claude-agent-sdk",
+      "/runtime/0.3.283",
+      io,
+    );
+    expect(spec).toBe(
+      "file:///runtime/0.3.283/node_modules/@anthropic-ai/claude-agent-sdk/sdk.mjs",
+    );
+  });
+
+  it("resolves a second package (zod) independently from the same manifest", () => {
+    const manifest = {
+      entries: {
+        "@anthropic-ai/claude-agent-sdk": "@anthropic-ai/claude-agent-sdk/sdk.mjs",
+        zod: "zod/index.js",
+      },
+    };
+    const io = {
+      readFileSync: vi.fn(() => JSON.stringify(manifest)),
+      pathToFileURL: vi.fn((p: string) => ({ href: `file://${p}` })),
+      join: vi.fn((...parts: string[]) => parts.join("/")),
+    };
+    const spec = resolveRuntimeModuleSpecifier("zod", "/runtime/0.3.283", io);
+    expect(spec).toBe("file:///runtime/0.3.283/node_modules/zod/index.js");
+  });
+
+  it("throws a clear error when the manifest has no entry for the package", () => {
+    const io = {
+      readFileSync: vi.fn(() => JSON.stringify({ entries: {} })),
+      pathToFileURL: vi.fn(),
+      join: vi.fn((...parts: string[]) => parts.join("/")),
+    };
+    expect(() => resolveRuntimeModuleSpecifier("zod", "/runtime/0.3.283", io)).toThrow(
+      /no entry for 'zod'/,
+    );
   });
 });

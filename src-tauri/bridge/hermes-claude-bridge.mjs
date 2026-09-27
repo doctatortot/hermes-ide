@@ -51,6 +51,7 @@
  *   --max-turns <n>               optional
  *   --working-dir <path>          required (set as `cwd` on SDK options)
  *   --hermes-app-id <id>          optional, for the SDK User-Agent header
+ *   --bridge-runtime-dir <path>   optional; set in production only (see ADR 002)
  *
  * Anything we don't recognize: ignored with a stderr warning.
  *
@@ -59,11 +60,11 @@
  * consumers must not depend on this format.
  */
 
-import { query, createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import { argv, exit, stdin, stdout, stderr } from "node:process";
 import { createInterface } from "node:readline";
 import { readFileSync, existsSync } from "node:fs";
-import { z } from "zod";
+import { pathToFileURL } from "node:url";
+import { join } from "node:path";
 import {
   createCanUseToolHandler,
   buildPermissionOptions,
@@ -72,6 +73,7 @@ import {
   createIdempotentLatch,
   createControlOpBuffer,
   toSdkUserMessage,
+  resolveRuntimeModuleSpecifier,
 } from "./bridgeRuntimeHelpers.mjs";
 
 // ─── 1. Parse CLI args ──────────────────────────────────────────────
@@ -91,6 +93,30 @@ if (!flags.workingDir) {
   stderr.write("[hermes-bridge] missing required --working-dir\n");
   exit(1);
 }
+
+// ─── 1b. Load the SDK + zod ─────────────────────────────────────────
+//
+// Dynamic (not static `import ... from "@anthropic-ai/claude-agent-sdk"`)
+// because production builds extract the SDK to an app-data directory that
+// is NOT adjacent to this file — a static or bare-specifier dynamic import
+// can only ever resolve relative to this file's own location. See
+// `resolveRuntimeModuleSpecifier()` in bridgeRuntimeHelpers.mjs and
+// docs/adr/002-bridge-runtime-tarball.md. In dev, `--bridge-runtime-dir` is
+// never passed (node_modules sits right here), so this resolves exactly
+// like the static imports it replaces — zero behavior change for dev.
+const runtimeIo = { readFileSync, pathToFileURL, join };
+const [{ query, createSdkMcpServer, tool }, { z }] = await Promise.all([
+  import(
+    resolveRuntimeModuleSpecifier(
+      "@anthropic-ai/claude-agent-sdk",
+      flags.bridgeRuntimeDir ?? null,
+      runtimeIo,
+    )
+  ),
+  import(
+    resolveRuntimeModuleSpecifier("zod", flags.bridgeRuntimeDir ?? null, runtimeIo)
+  ),
+]);
 
 // ─── 2. AsyncIterable of user inputs from stdin ─────────────────────
 
@@ -746,6 +772,7 @@ function parseFlags(args) {
     maxTurns: undefined,
     hermesAppId: undefined,
     hermesStatePath: undefined,
+    bridgeRuntimeDir: undefined,
   };
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
@@ -765,6 +792,7 @@ function parseFlags(args) {
       case "--max-turns":             out.maxTurns = Number(next()); break;
       case "--hermes-app-id":         out.hermesAppId = next(); break;
       case "--hermes-state-path":     out.hermesStatePath = next(); break;
+      case "--bridge-runtime-dir":    out.bridgeRuntimeDir = next(); break;
       // Quietly accept legacy claude flags Rust may still pass:
       case "--print":
       case "--output-format":
