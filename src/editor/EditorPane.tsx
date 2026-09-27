@@ -18,7 +18,6 @@ import { getLanguageSupport } from "./languageRegistry";
 import { createSyntaxHighlighting } from "./editorTheme";
 import { Minimap } from "./Minimap";
 import {
-  DEFAULT_EDITOR_FONT_PX,
   nextEditorFontSize,
   parseEditorFontSize,
 } from "./editorFontSize";
@@ -56,8 +55,9 @@ const baseTheme = EditorView.theme({
   ".cm-scroller": {
     overflow: "auto",
     fontFamily: "var(--font-mono)",
-    // fontSize is owned by the fontSizeCompartment so Mod+= / Mod+- /
-    // Mod+0 can update it live without rebuilding the EditorState.
+    // Follows the UI scale by default; a user override from Mod+= / Mod+-
+    // is layered on top via fontSizeCompartment (earlier extension wins).
+    fontSize: "var(--text-sm)",
     scrollbarWidth: "thin",
     scrollbarColor: "var(--bg-active) transparent",
   },
@@ -179,7 +179,9 @@ const baseTheme = EditorView.theme({
   },
 });
 
-function buildFontSizeExtension(px: number) {
+function buildFontSizeExtension(px: number | null) {
+  // No override: contribute nothing so baseTheme's var(--text-sm) applies.
+  if (px == null) return [];
   return EditorView.theme({
     ".cm-scroller": { fontSize: `${px}px` },
   });
@@ -229,8 +231,8 @@ export function EditorPane({ content, language, onContentChange, onSave, onCurso
   // Live font size, mutated by Mod+= / Mod+- / Mod+0 inside the keymap.
   // Held in a ref (not React state) so shortcut handlers can update it
   // without triggering a re-creation of the EditorView in the useEffect
-  // below that depends on `language`.
-  const fontSizePxRef = useRef<number>(DEFAULT_EDITOR_FONT_PX);
+  // below that depends on `language`. `null` = no override, follow the UI.
+  const fontSizePxRef = useRef<number | null>(null);
 
   // Keep callback refs up to date
   onContentChangeRef.current = onContentChange;
@@ -243,13 +245,15 @@ export function EditorPane({ content, language, onContentChange, onSave, onCurso
   const applyFontSizeAction = (action: "increase" | "decrease" | "reset"): boolean => {
     const view = viewRef.current;
     if (!view) return false;
-    const next = nextEditorFontSize(fontSizePxRef.current, action);
-    if (next === fontSizePxRef.current) return true; // already clamped at bound
+    const renderedPx = Number.parseFloat(getComputedStyle(view.scrollDOM).fontSize);
+    const next = nextEditorFontSize(fontSizePxRef.current, action, renderedPx);
+    if (next === fontSizePxRef.current) return true; // clamped at bound, or reset with no override
     fontSizePxRef.current = next;
     view.dispatch({
       effects: fontSizeCompartment.current.reconfigure(buildFontSizeExtension(next)),
     });
-    setSetting("editor_font_size", String(next)).catch((err) =>
+    // Reset stores "" so the editor follows the UI scale again.
+    setSetting("editor_font_size", next == null ? "" : String(next)).catch((err) =>
       console.warn("[EditorPane] Failed to persist editor_font_size:", err),
     );
     return true;
@@ -442,8 +446,8 @@ export function EditorPane({ content, language, onContentChange, onSave, onCurso
   }, [effectiveIndent.useTabs, effectiveIndent.size]);
 
   // Load the persisted editor_font_size on mount and apply it to the
-  // live view. Default is already set via the compartment's initial
-  // value, so a missing setting falls through cleanly.
+  // live view. With no stored value the compartment stays empty and the
+  // editor keeps following the UI scale.
   useEffect(() => {
     let cancelled = false;
     getSetting("editor_font_size")
