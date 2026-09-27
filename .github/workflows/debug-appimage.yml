@@ -62,19 +62,46 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
 
+      - name: Point apt at archive.ubuntu.com directly
+        run: |
+          set -e
+          # The GH-hosted runner's default sources.list uses Azure's regional
+          # mirror redirector (mirror+file:/etc/apt/apt-mirrors.txt), which has
+          # been serving an index that lists GStreamer package versions its
+          # backing pool then 404s on when actually fetched — reproduced twice,
+          # hours apart, on two different mirror IPs, always the same exact
+          # package/version. Bypassing it for the canonical direct Ubuntu
+          # archive (which Canonical publishes both index and pool to in sync)
+          # to see if that's a redirector-specific inconsistency.
+          if [ "${{ inputs.arch }}" = "aarch64" ]; then
+            SUITE="noble"
+            MIRROR="http://ports.ubuntu.com/ubuntu-ports"
+            SECURITY="http://ports.ubuntu.com/ubuntu-ports"
+          else
+            SUITE="jammy"
+            MIRROR="http://archive.ubuntu.com/ubuntu"
+            SECURITY="http://security.ubuntu.com/ubuntu"
+          fi
+          sudo rm -f /etc/apt/sources.list.d/*.list
+          sudo tee /etc/apt/sources.list > /dev/null <<EOF
+          deb $MIRROR $SUITE main restricted universe multiverse
+          deb $MIRROR $SUITE-updates main restricted universe multiverse
+          deb $MIRROR $SUITE-backports main restricted universe multiverse
+          deb $SECURITY $SUITE-security main restricted universe multiverse
+          EOF
+          sudo apt-get update
+
       - name: Cache apt packages
         uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
         with:
           packages: libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libfuse2 file desktop-file-utils
-          # Cache key bumped from 1.0 -> 1.2: the version-1.0 cache appears to
-          # have been poisoned with an empty package set (this action reports
-          # success and silently caches "0 installed packages" when apt-get
-          # can't fetch every archive in one transaction — confirmed on
-          # scratch/adr002-appimage-verify, where a version:1.1 cache-bust
-          # attempt hit a transient apt-mirror 404 on unrelated GStreamer
-          # packages and reproduced the exact same silent 0-package cache).
-          # 1.2 is a fresh key neither attempt has touched.
-          version: 1.2
+          # Cache key bumped 1.0 -> 1.2 -> 1.3: 1.0 and 1.1 (see prior comment
+          # history) both silently cached "0 installed packages" — this action
+          # reports success even when apt-get can't fetch every archive in one
+          # transaction. 1.2 (tested against the old mirror redirector) hit the
+          # exact same silent-empty-cache failure. 1.3 is fresh, paired with
+          # the direct-archive switch above.
+          version: 1.3
 
       - name: Install npm deps + stage bridge runtime
         run: npm ci
