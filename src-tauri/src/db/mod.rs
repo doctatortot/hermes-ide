@@ -1129,7 +1129,7 @@ impl Database {
         Ok(rowid)
     }
 
-    /// Delete all but the `keep` most-recent rows (by timestamp) for one session.
+    /// Delete all but the `keep` most-recent rows (by timestamp, then id) for one session.
     pub fn prune_execution_nodes(&self, session_id: &str, keep: i64) -> Result<(), String> {
         self.conn
             .execute(
@@ -1138,7 +1138,7 @@ impl Database {
                AND id NOT IN (
                    SELECT id FROM execution_nodes
                    WHERE session_id = ?1
-                   ORDER BY timestamp DESC
+                   ORDER BY timestamp DESC, id DESC
                    LIMIT ?2
                )",
                 params![session_id, keep],
@@ -3294,6 +3294,58 @@ mod tests {
             timestamps.iter().all(|&t| t >= 7),
             "kept rows should be most recent: {:?}",
             timestamps
+        );
+    }
+
+    #[test]
+    fn test_prune_execution_nodes_same_timestamp_keeps_highest_ids() {
+        // Run with the real schema and with the (session_id, timestamp) index
+        // dropped: without the index SQLite sorts ties in rowid-ascending
+        // order, so an ORDER BY with no id tiebreaker keeps the oldest rows.
+        for drop_index in [false, true] {
+            assert_same_timestamp_prune_keeps_highest_ids(drop_index);
+        }
+    }
+
+    fn assert_same_timestamp_prune_keeps_highest_ids(drop_index: bool) {
+        let db = test_db();
+        if drop_index {
+            db.conn
+                .execute("DROP INDEX idx_exec_nodes_session", [])
+                .unwrap();
+        }
+        let sid = "sess-prune-ties";
+        // All rows share one timestamp (whole seconds make ties common).
+        for _ in 0..10 {
+            db.conn.execute(
+                "INSERT INTO execution_nodes
+                 (session_id, timestamp, kind, input, output_summary, exit_code, working_dir, duration_ms, metadata)
+                 VALUES (?1, 42, 'command', NULL, NULL, NULL, '/tmp', 0, NULL)",
+                params![sid],
+            ).unwrap();
+        }
+        let mut all_ids: Vec<i64> = db
+            .get_execution_nodes(sid, 100, 0)
+            .unwrap()
+            .iter()
+            .map(|n| n.id)
+            .collect();
+        all_ids.sort_unstable();
+        let expected: Vec<i64> = all_ids[all_ids.len() - 3..].to_vec();
+
+        db.prune_execution_nodes(sid, 3).unwrap();
+
+        let mut kept: Vec<i64> = db
+            .get_execution_nodes(sid, 100, 0)
+            .unwrap()
+            .iter()
+            .map(|n| n.id)
+            .collect();
+        kept.sort_unstable();
+        assert_eq!(
+            kept, expected,
+            "newest (highest id) rows must survive a timestamp tie (drop_index={})",
+            drop_index
         );
     }
 
