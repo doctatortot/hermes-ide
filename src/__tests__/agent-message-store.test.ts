@@ -210,6 +210,92 @@ describe("messageStore", () => {
     expect(state.lastError).toBe("boom");
   });
 
+  /* ─── lastError lifecycle (1.3.x regression / 1.3.1 fix) ──────────
+   *
+   * Background: the user-reported bug where a "prompt is too long"
+   * result event left the session stuck — the result-event-error
+   * banner needs `state.lastError` to render.  Two contracts to pin:
+   *
+   *   1. A subsequent SUCCESSFUL result event must clear `lastError`,
+   *      so once the user has recovered (via /compact, /branch, etc.)
+   *      the banner stops sticking around for unrelated turns.
+   *   2. Non-result events between turns must NOT clear `lastError` —
+   *      otherwise the banner would vanish as soon as the next turn
+   *      starts streaming, before the user has had a chance to read
+   *      what went wrong.
+   */
+  it("clears lastError when a successful result event lands (post-recovery)", () => {
+    let state = emptyState();
+    state = reduceEvent(state, {
+      type: "result",
+      subtype: "error",
+      is_error: true,
+      result: "prompt is too long",
+    } as ResultEvent);
+    expect(state.lastError).toBe("prompt is too long");
+
+    state = reduceEvent(state, {
+      type: "result",
+      subtype: "success",
+      is_error: false,
+    } as ResultEvent);
+    expect(state.lastError).toBeNull();
+  });
+
+  it("preserves lastError across in-turn assistant events", () => {
+    // After an error result, the next turn begins streaming (assistant
+    // events arrive before its result lands).  The banner must remain
+    // visible — clearing lastError pre-result would make it disappear
+    // before the user could read it.
+    let state = emptyState();
+    state = reduceEvent(state, {
+      type: "result",
+      subtype: "error",
+      is_error: true,
+      result: "prompt is too long",
+    } as ResultEvent);
+    state = reduceEvent(state, {
+      type: "assistant",
+      message: {
+        id: "msg-1",
+        role: "assistant",
+        model: "claude-opus-4-7",
+        content: [{ type: "text", text: "Let me retry that." }],
+      },
+      session_id: "s",
+      uuid: "u",
+    } as AssistantEvent);
+    expect(state.lastError).toBe("prompt is too long");
+  });
+
+  it("also clears a parse_error-sourced lastError when a success result lands", () => {
+    // parse_error events ALSO write to lastError (messageStore.ts:974).
+    // The clearing contract must be symmetric — a successful turn
+    // wipes whichever flavour of error preceded it.
+    let state = emptyState();
+    state = reduceEvent(state, {
+      type: "parse_error",
+      raw: "{garbage",
+      error: "Unexpected end of JSON input",
+    });
+    expect(state.lastError).toBe("Unexpected end of JSON input");
+    state = reduceEvent(state, {
+      type: "result",
+      subtype: "success",
+      is_error: false,
+    } as ResultEvent);
+    expect(state.lastError).toBeNull();
+  });
+
+  it("success result on an already-clean state leaves lastError null", () => {
+    const state = reduceEvent(emptyState(), {
+      type: "result",
+      subtype: "success",
+      is_error: false,
+    } as ResultEvent);
+    expect(state.lastError).toBeNull();
+  });
+
   it("captures rate-limit info from a synthetic event", () => {
     const event: RateLimitEvent = {
       type: "rate_limit_event",

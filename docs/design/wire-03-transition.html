@@ -1,0 +1,64 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Wire — thinking → tool running transition</title>
+<style>
+  :root{
+    --bg-0:#1a1c20;--bg-1:#20232a;--text-1:#d6d6d9;--text-2:#8e8e93;--text-3:#5c5c61;
+    --brass:#ffb340;--brass-dim:rgba(255,179,64,.18);--rule:#2d2d2f;
+    --font-ui:"Inter Tight",system-ui,sans-serif;
+    --font-serif:"Newsreader",Georgia,serif;
+    --font-code:"JetBrains Mono",Menlo,monospace;
+    --dur-quick:140ms;--dur-base:220ms;
+    --ease-out-soft:cubic-bezier(.22,.61,.36,1);
+  }
+  html,body{margin:0;background:var(--bg-0);color:var(--text-1);font-family:var(--font-ui);
+    display:flex;align-items:center;justify-content:center;min-height:100vh;}
+  .frame{width:780px;border:1px solid var(--rule);background:var(--bg-1);}
+  .body{padding:24px;color:var(--text-2);font-family:var(--font-serif);font-size:13px;line-height:1.6}
+
+  .wire{
+    display:grid;grid-template-columns:max-content 1fr max-content;
+    align-items:baseline;gap:12px;height:28px;padding:0 12px;
+    border-top:1px solid var(--rule);border-bottom:1px solid var(--brass-dim);
+    background:linear-gradient(to bottom,transparent,rgba(255,179,64,.03));
+    overflow:hidden;
+  }
+  .wire__kicker{font-family:var(--font-code);font-size:10px;letter-spacing:.08em;
+    text-transform:uppercase;color:var(--text-2);position:relative;width:88px}
+  .wire__kicker > span{position:absolute;inset:0;animation:swap 4s infinite var(--ease-out-soft)}
+  .wire__kicker > span:nth-child(2){animation-delay:2s;opacity:0}
+
+  .wire__caption{font-family:var(--font-serif);font-style:italic;font-size:13px;line-height:1.2;
+    color:var(--text-1);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;position:relative;}
+  .wire__caption > span{position:absolute;inset:0;animation:swap 4s infinite var(--ease-out-soft)}
+  .wire__caption > span:nth-child(2){animation-delay:2s;opacity:0}
+
+  .wire__chrono{font-family:var(--font-code);font-size:11px;color:var(--text-3);font-variant-numeric:tabular-nums;}
+  .spark{display:inline-block;width:.6ch;height:1.5px;margin-left:2px;vertical-align:baseline;
+    background:var(--brass);box-shadow:0 0 6px 0 var(--brass-dim);
+    animation:breathe 1050ms var(--ease-out-soft) infinite alternate}
+
+  @keyframes swap{
+    0%,45%   {opacity:1;transform:translateY(0)}
+    50%,95%  {opacity:0;transform:translateY(-2px)}
+    100%     {opacity:1;transform:translateY(0)}
+  }
+  @keyframes breathe{from{opacity:.55}to{opacity:1}}
+  .caption-code{font-family:var(--font-code);font-style:normal;font-size:12px;color:var(--text-1)}
+  .legend{max-width:780px;margin:16px auto 0;color:var(--text-3);font-size:11px;font-family:var(--font-code);
+    letter-spacing:.05em;text-transform:uppercase;text-align:center}
+</style></head>
+<body>
+<div>
+  <div class="frame">
+    <div class="body">Looping every 4s: <em>thinking</em> dissolves into <em>tool running</em> on the same wire.</div>
+    <div class="wire">
+      <div class="wire__kicker"><span>Thinking</span><span>Running</span></div>
+      <div class="wire__caption">
+        <span>weighing the trade-off between mutating in place and copying the array&hellip;</span>
+        <span>Bash — <span class="caption-code">pnpm test --filter=agent</span><span class="spark"></span></span>
+      </div>
+      <span class="wire__chrono">0:03</span>
+    </div>
+  </div>
+  <div class="legend">cross-dissolve · dur-quick · ease-out-soft · spark breathes at 0.95 Hz</div>
+</div>
+</body></html>

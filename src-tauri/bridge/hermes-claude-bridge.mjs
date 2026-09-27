@@ -71,6 +71,7 @@ import {
 import {
   createIdempotentLatch,
   createControlOpBuffer,
+  toSdkUserMessage,
 } from "./bridgeRuntimeHelpers.mjs";
 
 // ─── 1. Parse CLI args ──────────────────────────────────────────────
@@ -240,19 +241,8 @@ async function* userInputIterator() {
         stdinPaused = false;
         try { rl.resume(); } catch { /* readline may have closed */ }
       }
-      // Normalize to the SDKUserMessage shape the SDK expects.  Old Hermes
-      // envelopes lack `parent_tool_use_id`; the SDK wants null, not absent.
-      // session_id falls back to whatever Rust gave us; the SDK fills it
-      // in from the active session if absent.
-      yield {
-        type: "user",
-        message: next.message,
-        parent_tool_use_id: next.parent_tool_use_id ?? null,
-        uuid: next.uuid,
-        ...(next.session_id || flags.sessionId
-          ? { session_id: next.session_id ?? flags.sessionId }
-          : {}),
-      };
+      // Normalize to the SDKUserMessage shape — see toSdkUserMessage().
+      yield toSdkUserMessage(next, flags.sessionId);
       continue;
     }
     if (inputClosed) return;
@@ -486,6 +476,15 @@ const sdkOptions = {
   ...buildPermissionOptions(flags),
   ...(flags.effort ? { effort: flags.effort } : {}),
   ...(flags.addDir.length > 0 ? { additionalDirectories: flags.addDir } : {}),
+  // Force `display: "summarized"` on the thinking config so the SDK
+  // emits `thinking_delta` partial events even on models that default
+  // to `display: "omitted"` (Opus 4.7, Claude Mythos Preview).  Without
+  // this, those models stream a single `signature_delta` and the
+  // operator sees an empty thinking block until the turn ends.
+  // `type: "adaptive"` lets Claude choose the budget per turn (Opus
+  // 4.6+ semantics); older models silently ignore the field.
+  // See https://platform.claude.com/docs/en/build-with-claude/extended-thinking
+  thinking: { type: "adaptive", display: "summarized" },
   includePartialMessages: !!flags.includePartialMessages,
   includeHookEvents: !!flags.includeHookEvents,
   ...(flags.maxBudgetUsd != null ? { maxBudgetUsd: flags.maxBudgetUsd } : {}),
@@ -497,6 +496,8 @@ const sdkOptions = {
   // Auto-allow only tools that have NO interactive UI to render —
   //   * mcp__hermes__*  : our IDE-context MCP tools, never destructive
   //   * TodoWrite       : produces a side-panel UI, no permission UX
+  //   * Task{Create,Update,Get,List} : SDK 0.3.x's replacement for
+  //                       TodoWrite — session-local task list, same risk
   //
   // AskUserQuestion / ExitPlanMode / EnterPlanMode are intentionally
   // routed through `canUseTool` so the bridge fires a perm-request the
@@ -506,6 +507,10 @@ const sdkOptions = {
   allowedTools: [
     "mcp__hermes__*",
     "TodoWrite",
+    "TaskCreate",
+    "TaskUpdate",
+    "TaskGet",
+    "TaskList",
   ],
   // Inject IDE state on session start, resume, and after compactions.
   // Invisible to the transcript; the user never sees this in the chat.

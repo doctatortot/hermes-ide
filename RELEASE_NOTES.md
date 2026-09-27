@@ -1,50 +1,71 @@
-# Hermes IDE 1.2.1
+# Hermes IDE 1.4.0
 
-A focused stability release closing six regressions introduced by the
-1.2 design refresh.
+Hermes now speaks your language. The interface ships translated into
+eight languages, and switching takes two clicks — no restart.
 
-## Slash commands with arguments now run as expected
+## Eight languages, built in
 
-Typing `/remote-control random`, `/agents create foo`, or any other
-CLI slash command followed by arguments used to be rejected with
-"isn't available in this environment." These commands now open the
-embedded terminal with their arguments intact, the way they always
-should have.
+Open **Plugins → Hermes Language Pack** and pick your language from
+the selector: Russian, Spanish, French, German, Portuguese (Brazil),
+Simplified Chinese, Japanese, or Hindi — alongside English.
 
-## CLI slash commands find `claude` again on app launches
+The switch is instant: every translated surface re-renders in place.
+Your choice is remembered across launches.
 
-Running `/mcp`, `/agents`, `/remote-control`, etc. from a Finder- or
-Launchpad-launched Hermes was failing with "No viable candidates
-found in PATH" because the system PATH the app inherits at launch
-doesn't include the toolchain folders where `claude` actually lives.
-The embedded terminal now augments its PATH the same way the main
-agent does, so the binary is found regardless of how you launched
-the app.
+## The whole interface, not just the menus
 
-## Pasted image thumbnails no longer crash into the prompt
+Translations cover the surfaces you actually live in: the start
+screen, the command palette and every shortcut description, the
+settings tabs end to end, the session creation flow including the SSH
+and tmux steps, the usage and plan limits panel, the plugin manager,
+and the prompt composer with its roles, styles, and templates.
 
-The thumbnail row above the composer now has proper breathing room
-below the images. Previously the bottom of an attached thumbnail sat
-flush against the text input.
+The language pack is a built-in plugin, so it appears in your
+installed plugins list where you can see its version and manage it
+like anything else — but there is nothing to install, and it can't be
+removed by accident.
 
-## "Show N more lines" button no longer drifts under your cursor
+One honest limit: the native macOS menu bar stays English for now.
 
-Two distinct bugs were causing the expand button on long code blocks
-to "move and move back" — leaving you stabbing at it three or four
-times before a click registered. Both are gone: the button now sits
-stably under your cursor on press and the first click expands the
-block.
+## The latest Claude, in agent mode
 
-## Stop button actually stops the spinner
+Agent mode now runs on the newest Claude tooling, and the model picker
+gains **Fable 5.1** alongside Opus, Sonnet, and Haiku — which now point
+at the latest version of each model automatically.
 
-Hitting Stop before Claude streamed its first reply used to leave
-the "awaiting claude" indicator spinning forever, even though the
-request was already cancelled and "[Request interrupted by user]"
-was visible. The indicator now clears the moment the interrupt
-completes.
+Claude's task list keeps working with the new tooling: the TODO panel
+fills in and updates as Claude plans and checks off its work.
 
-## Scan button stays inside the New-Session wizard
+## Closed sessions stay closed
 
-The Scan button in the Project Context step was hanging off the
-right edge of narrow dialogs. The footer row now fits regardless of
-the dialog width — the input shrinks before the buttons do.
+If you closed a terminal session while a program inside it was still
+running, the session could come back — often after your computer woke
+from sleep — as a black, unusable entry in the sidebar that no amount
+of closing would remove. Closed sessions now stay gone, and whatever
+was still running inside them is shut down with them.
+
+## Fixes
+
+- Switching to another session and back now opens the conversation at
+  the latest message instead of at the top.
+- **Split Right** and **Split Down** from the terminal's right-click
+  menu now open a fresh session with a working prompt instead of an
+  empty pane.
+- On Windows, Hermes no longer opens off-screen or "vanishes" after
+  being minimized or maximized.
+- On Windows, agent sessions no longer crash on the first message with
+  an `EISDIR: lstat 'C:'` error.
+- Session cards and pane headers show the model you're actually using
+  instead of just "claude".
+- When Hermes can't create a session's branch workspace, you now get a
+  clear message instead of the session silently not appearing.
+- Keystrokes typed inside full-screen programs (Claude, vim, less, and
+  the like) no longer end up in your shell history and suggestions.
+- Kiro's auto mode now launches with the right permission setting.
+
+## Also in this release
+
+- The usage panel now counts input tokens from the whole session,
+  including the turns that happened before you opened the panel.
+- The Context Panel action on the start screen works before you've
+  opened a session.

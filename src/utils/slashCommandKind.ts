@@ -274,3 +274,127 @@ export function missingCliBuiltins(
   const have = new Set(existing.map((e) => e.command.toLowerCase()));
   return CLAUDE_CLI_BUILTINS.filter((b) => !have.has(b.command.toLowerCase()));
 }
+
+/* ─── SDK init.slash_commands → typed item builder ──────────────────
+ *
+ * The SDK's `init.slash_commands` enumerates verbs available natively
+ * over the stream-json transport.  Two forms in the wild:
+ *
+ *   - bare string:        "compact"                         (v2.1.x)
+ *   - object with desc:   { command: "/compact", description: "…" }
+ *
+ * Bare strings carry NO description, which used to trip the classifier
+ * into mis-routing them to the embedded-terminal path (every entry the
+ * SDK reports happens to also be in KNOWN_CLI_COMMANDS — `clear`,
+ * `compact`, `init`, `review` — so the classifier's name-collision
+ * fallback would fire and stamp `kind: "cli"`).  The cure is to honour
+ * the SDK's enumeration as authoritative: ANY name reported in init
+ * gets `kind: "native"`, BEFORE any classifier-based fallback runs.
+ *
+ * This builder also folds the curated CLI catalog into the result —
+ * the well-known interactive verbs (`/mcp`, `/agents`, `/login`, …)
+ * that the SDK omits because they don't work over stream-json get
+ * appended with `kind: "cli"` so the popover surfaces them too. */
+export type SlashItemSource = "builtin" | "user" | "project";
+
+export interface ResolvedSlashItem {
+  command: string;
+  description: string;
+  source: SlashItemSource;
+  kind: SlashCommandKind;
+}
+
+type RawInitEntry = string | { command?: unknown; description?: unknown };
+
+function ensureLeadingSlash(s: string): string {
+  return s.startsWith("/") ? s : `/${s}`;
+}
+
+export function buildSlashItemsFromInit(
+  rawInit: ReadonlyArray<RawInitEntry> | undefined,
+  prewarmCommands: readonly string[] = [],
+): ResolvedSlashItem[] {
+  let items: ResolvedSlashItem[];
+
+  if (Array.isArray(rawInit)) {
+    items = rawInit
+      .map((entry): ResolvedSlashItem | null => {
+        if (typeof entry === "string") {
+          // Bare-string entries from the SDK — authoritative native.
+          return {
+            command: ensureLeadingSlash(entry),
+            description: "",
+            source: "builtin",
+            kind: "native",
+          };
+        }
+        if (entry && typeof entry === "object") {
+          const cmdRaw = (entry as { command?: unknown }).command;
+          if (typeof cmdRaw !== "string" || cmdRaw.length === 0) return null;
+          const descRaw = (entry as { description?: unknown }).description;
+          return {
+            command: ensureLeadingSlash(cmdRaw),
+            description: typeof descRaw === "string" ? descRaw : "",
+            source: "builtin",
+            // Object-form items also come from the SDK; the description
+            // exists to inform the popover row, not to gate routing.
+            kind: "native",
+          };
+        }
+        return null;
+      })
+      .filter((c): c is ResolvedSlashItem => c !== null);
+  } else {
+    // No init yet — fall back to whatever the prewarm scan found on
+    // disk under `.claude/commands/*.md`.  These are typically user
+    // skills; run them through the classifier (unknown verbs → native).
+    items = prewarmCommands.map((cmd): ResolvedSlashItem => {
+      const command = ensureLeadingSlash(cmd);
+      return {
+        command,
+        description: "",
+        source: "builtin",
+        kind: classifySlashCommand({ command }),
+      };
+    });
+  }
+
+  // Append curated CLI builtins missing from the list so /mcp, /login,
+  // /agents etc. always appear in the popover even when the SDK omits
+  // them.  Existing entries (including the SDK-native ones we just
+  // pinned above) are skipped by `missingCliBuiltins`'s dedup pass.
+  for (const builtin of missingCliBuiltins(items)) {
+    items.push({
+      command: builtin.command,
+      description: builtin.description,
+      source: "builtin",
+      kind: "cli",
+    });
+  }
+
+  return items;
+}
+
+/** Decide how to route a slash command at submit time, preferring the
+ *  SDK's verdict (from `buildSlashItemsFromInit`) over the heuristic
+ *  classifier.  Used by the composer when the user types a slash
+ *  command and hits Enter WITHOUT picking from the dropdown — the
+ *  dropdown's accept path already carries the resolved `kind`, but the
+ *  raw-typed path has to look it up.
+ *
+ *  Trailing arguments are stripped before lookup so
+ *  `/compact some text` matches `/compact`.  Match is case-insensitive
+ *  so `/COMPACT` and `/Compact` route the same. */
+export function resolveSlashCommandKind(
+  command: string,
+  items: ReadonlyArray<{ command: string; kind?: SlashCommandKind }>,
+): SlashCommandKind {
+  const firstToken = command.trim().split(/\s+/, 1)[0] ?? "";
+  const lookup = firstToken.toLowerCase();
+  for (const item of items) {
+    if (item.command.toLowerCase() === lookup && item.kind) {
+      return item.kind;
+    }
+  }
+  return classifySlashCommand({ command: firstToken });
+}

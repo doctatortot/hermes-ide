@@ -1,5 +1,5 @@
 import "../styles/components/agent/AgentSessionView.css";
-import { memo, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { listen } from "@tauri-apps/api/event";
 import type {
   AgentEvent,
@@ -20,10 +20,13 @@ import type { AgentSessionState, RenderedMessage } from "./messageStore";
 import { getOrCreateAgentSessionStore } from "./agentSessionStore";
 import { TextBlock } from "./blocks/TextBlock";
 import { ThinkingBlock } from "./blocks/ThinkingBlock";
-import { ThinkingIndicator } from "./blocks/ThinkingIndicator";
 import { ToolUseBlock } from "./blocks/ToolUseBlock";
 import { ImageBlock } from "./blocks/ImageBlock";
 import { ResultFooter } from "./blocks/ResultFooter";
+import { SubagentMastheadChip } from "./SubagentMastheadChip";
+import { selectWorkingState } from "./workingState";
+import { WorkingFootline } from "./WorkingFootline";
+import { MarginDraft } from "./MarginDraft";
 import { AskUserQuestionCard } from "../components/AskUserQuestionCard";
 import { ExitPlanModeCard } from "../components/ExitPlanModeCard";
 import { PermissionRequestModal } from "../components/PermissionRequestModal";
@@ -35,7 +38,13 @@ import {
   buildPermResponse,
   type PermissionDecision,
 } from "../utils/permissionRequest";
-import { extractTodosFromMessages } from "../utils/todoStore";
+import { extractTodoSnapshot } from "../utils/todoStore";
+import { selectFatalError } from "./errorSelector";
+import {
+  slashReceiptAfterUserMessage,
+  slashReceiptForMessage,
+  type SlashReceipt,
+} from "./slashReceiptSelector";
 
 interface AgentSessionViewProps {
   sessionId: string;
@@ -100,18 +109,37 @@ export function AgentSessionView({ sessionId, workspacePathCount }: AgentSession
   // event with a small tolerance — momentum scroll, sub-pixel rounding,
   // and cross-platform scrollbar sizes can leave a few pixels of error
   // even when the user is "at the bottom", so 24px is a safe margin.
-  useEffect(() => {
+  //
+  // Re-runs whenever the timeline opens a conversation: on mount (tab
+  // switch back from a terminal remounts us), when the pane swaps to a
+  // different session in place (same instance, same scroll element), and
+  // when the scroll element first appears after the empty state.  Each
+  // time, start at the latest message (#327/#328) — measuring on mount
+  // saw scrollTop 0, cleared the sticky flag, and left the view at the top.
+  const hasTimeline = state.initialized || !!exitInfo || state.messages.length > 0;
+  useLayoutEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
     const STICKY_THRESHOLD = 24;
+    // Only an UPWARD move can unstick.  Scroll events land a frame after
+    // our own `scrollTop = scrollHeight`; if streaming grew the content in
+    // that gap, the echo measures distance > threshold even though nobody
+    // touched anything.  Content growth never changes scrollTop and our
+    // programmatic scrolls only move down, so a decrease means the user.
+    let lastTop = 0;
     const onScroll = () => {
-      const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
-      stickyBottomRef.current = distance <= STICKY_THRESHOLD;
+      const top = el.scrollTop;
+      const distance = el.scrollHeight - top - el.clientHeight;
+      if (distance <= STICKY_THRESHOLD) stickyBottomRef.current = true;
+      else if (top < lastTop) stickyBottomRef.current = false;
+      lastTop = top;
     };
     el.addEventListener("scroll", onScroll, { passive: true });
-    onScroll();
+    stickyBottomRef.current = true;
+    el.scrollTop = el.scrollHeight;
+    lastTop = el.scrollTop;
     return () => el.removeEventListener("scroll", onScroll);
-  }, []);
+  }, [sessionId, hasTimeline]);
 
   // Auto-scroll on new messages — but only when the user is at the bottom.
   // If they've scrolled up to re-read history, never yank them back.
@@ -121,6 +149,14 @@ export function AgentSessionView({ sessionId, workspacePathCount }: AgentSession
   // forces a synchronous layout. We schedule at most one scroll-to-bottom
   // per animation frame so streaming taxes the layout pipeline only at
   // the display refresh rate.
+  //
+  // The dep list MUST include `streamingThinkingText` and
+  // `streamingMessageId`: when the thinking body grows via partial
+  // `thinking_delta` events, `state.messages` doesn't change (the
+  // growing text lives in the accumulator, surfaced via the
+  // BlockRenderer's fallback).  Without these deps, the bottom of the
+  // pane drifts upward off-screen as the body grows even though the
+  // user was sticky-bottom when the turn started.
   const pendingScrollRef = useRef(false);
   useEffect(() => {
     if (pendingScrollRef.current) return;
@@ -136,23 +172,43 @@ export function AgentSessionView({ sessionId, workspacePathCount }: AgentSession
       pendingScrollRef.current = false;
       cancelAnimationFrame(id);
     };
-  }, [state.messages, state.resultEvent, exitInfo]);
+  }, [
+    state.messages,
+    state.resultEvent,
+    exitInfo,
+    state.streamingThinkingText,
+    state.streamingMessageId,
+  ]);
 
   // Hooks below MUST run on every render — they sit above the
   // empty-state early return so the hook count never changes between
   // pre-init and post-first-message renders (see React #310).
-  const todos = useMemo(
-    () => extractTodosFromMessages(state.messages),
-    [state.messages],
+  const todoSnapshot = useMemo(
+    () => extractTodoSnapshot(state.messages, state.toolResults),
+    [state.messages, state.toolResults],
   );
   // AGENT-09: turn-number assignment is memoized so it doesn't recompute
   // on every reducer notification (it only depends on `state.messages`).
   // MUST be above the early return for the same React #310 reason.
+  //
+  // SUBAGENT-FILTER: messages with a `parentToolUseId` belong to a
+  // subagent (Task tool fan-out).  They're surfaced under their parent
+  // Task block via `<SubagentList>` as compact rows; rendering them
+  // ALSO as full-size messages in the main flow doubled their visual
+  // weight and overwhelmed the conversation.  Filter them out here
+  // — the main flat list only carries top-level turns.
   const numbered = useMemo(
-    () => assignTurnNumbers(state.messages),
+    () => assignTurnNumbers(state.messages.filter((m) => !m.parentToolUseId)),
     [state.messages],
   );
   const turnCount = numbered.length === 0 ? 0 : numbered[numbered.length - 1].turn;
+
+  // Working surface state — MUST live above the empty-state early
+  // return (React #310, same reason as the other useMemos above).
+  // Drives the <WorkingFootline /> + <MarginDraft /> pair that
+  // subsumes the legacy ThinkingIndicator, the brass cursor block,
+  // and the masthead "Running …" ticker.
+  const workingState = useMemo(() => selectWorkingState(state), [state]);
   // Read the user's CURRENT intended mode from session state, not from
   // the bridge's stale init event.  When the user flips the chip mid-
   // session, the reducer updates `permission_mode` immediately, so the
@@ -161,7 +217,7 @@ export function AgentSessionView({ sessionId, workspacePathCount }: AgentSession
   // surfaced a session entry yet.
   const sessionEntryForPerm = sessionCtx.state.sessions[sessionId];
 
-  if (!state.initialized && !exitInfo && state.messages.length === 0) {
+  if (!hasTimeline) {
     // Claude's `--print --input-format stream-json` mode doesn't emit anything
     // (not even the init event) until it receives the first user message on
     // stdin. So the "pre-init" state is just the user's empty inbox — invite
@@ -189,29 +245,9 @@ export function AgentSessionView({ sessionId, workspacePathCount }: AgentSession
   // (`numbered` and `turnCount` are computed above the empty-state early
   //  return — see the AGENT-09 comment near the top of the body.)
 
-  // Decide whether to render the vintage thinking indicator.
-  //
-  // Two cases fire it:
-  //   1. Post-init normal turn — Claude is thinking / running a tool /
-  //      awaiting after a user message, and no streaming text has
-  //      begun yet (the heartbeat cursor takes over once tokens start
-  //      arriving on the assistant's reply).
-  //   2. Pre-init FIRST turn — the user has sent their first message
-  //      (state.messages.length > 0) but the bridge hasn't emitted
-  //      init yet.  Without this, the user sees their echoed prompt
-  //      and then dead silence until init arrives — which can be a
-  //      noticeable beat on cold spawns.  The indicator fills the gap.
-  const activity = deriveActivity(state);
-  const isBootingFirstTurn = !state.initialized && state.messages.length > 0;
-  const showThinkingIndicator =
-    (state.initialized || isBootingFirstTurn)
-    && (activity.status === "awaiting" || activity.status === "thinking" || activity.status === "running")
-    && (state.streamingMessageId === null
-      || !hasAnyTextBlock(
-          state.messages.find(
-            (m) => m.role === "assistant" && m.id === state.streamingMessageId,
-          ),
-        ));
+  // (`workingState` is computed above the empty-state early return
+  //  for hook-order reasons — see the AGENT-09 comment near the top
+  //  of the body.)
 
   // ─── Interactive tools ───────────────────────────────────────────
   // AskUserQuestion / ExitPlanMode are dispatched via the
@@ -227,31 +263,89 @@ export function AgentSessionView({ sessionId, workspacePathCount }: AgentSession
     ?? "default";
 
   return (
-    <div className="agent-session-view">
+    <div className="agent-session-view" data-session-id={sessionId}>
       <AgentHeader state={state} sessionId={sessionId} workspacePathCount={workspacePathCount} />
       <div className="agent-session-scroll" ref={scrollRef}>
         <div className="agent-session-messages">
-          {numbered.map(({ message, turn, isFirstOfTurn }) => (
-            <MessageRow
-              key={message.id}
-              message={message}
-              turnNumber={turn}
-              isFirstOfTurn={isFirstOfTurn}
-              toolResults={state.toolResults}
-              streamingMessageId={state.streamingMessageId}
-              thinkingStartedAt={state.thinkingStartedAt}
-              thinkingElapsed={state.thinkingElapsed}
-              streamingThinkingText={state.streamingThinkingText}
-            />
-          ))}
-          {showThinkingIndicator ? (
-            <ThinkingIndicator
-              since={activity.since}
-              variant={activity.status as "awaiting" | "thinking" | "running"}
-              toolName={activity.toolName}
-            />
-          ) : null}
+          {numbered.flatMap(({ message, turn, isFirstOfTurn }, idx, arr) => {
+            const prev = idx > 0 ? arr[idx - 1].message : null;
+            const next = idx + 1 < arr.length ? arr[idx + 1].message : null;
+            const out: ReactNode[] = [];
+
+            // Path A — empty assistant turn following a receipt-verb
+            // user message (e.g. `/clear` → "(no content)"): swap the
+            // empty assistant for a receipt card.
+            const replaceReceipt = slashReceiptForMessage(message, prev);
+            if (replaceReceipt) {
+              out.push(
+                <SlashReceiptCard
+                  key={message.id}
+                  receipt={replaceReceipt}
+                  isFirstOfTurn={isFirstOfTurn}
+                />,
+              );
+            } else {
+              out.push(
+                <MessageRow
+                  key={message.id}
+                  message={message}
+                  turnNumber={turn}
+                  isFirstOfTurn={isFirstOfTurn}
+                  toolResults={state.toolResults}
+                  streamingMessageId={state.streamingMessageId}
+                  thinkingStartedAt={state.thinkingStartedAt}
+                  thinkingElapsed={state.thinkingElapsed}
+                  streamingThinkingText={state.streamingThinkingText}
+                />,
+              );
+            }
+
+            // Path B — user submitted a receipt verb that produced NO
+            // assistant turn at all (e.g. `/compact` → only a result
+            // event lands).  Inject a synthetic receipt after the user
+            // message so the timeline acknowledges the action.
+            const injectReceipt = slashReceiptAfterUserMessage(message, next);
+            if (injectReceipt) {
+              out.push(
+                <SlashReceiptCard
+                  key={`${message.id}-receipt`}
+                  receipt={injectReceipt}
+                  isFirstOfTurn={true}
+                />,
+              );
+            }
+
+            return out;
+          })}
           {state.resultEvent ? <ResultFooter result={state.resultEvent} /> : null}
+          {/* Result-event error banner — Claude returned `is_error: true`
+              (e.g. "prompt is too long").  The subprocess exits with
+              code 0 in this case, so the exit-notice block below never
+              fires; without this banner the user just saw the assistant
+              freeze with no explanation.  See `errorSelector.ts`. */}
+          {(() => {
+            const fatal = selectFatalError(state);
+            if (!fatal) return null;
+            return (
+              <div
+                className="agent-result-error"
+                role="alert"
+                data-kind={fatal.isContextLimit ? "context-limit" : "generic"}
+              >
+                <div className="agent-result-error-title">
+                  Claude couldn't continue
+                </div>
+                <pre className="agent-result-error-body">{fatal.message}</pre>
+                {fatal.isContextLimit ? (
+                  <div className="agent-result-error-hint">
+                    The conversation has grown past the model's context window.
+                    Try <code>/compact</code> to summarize the history, or
+                    fork a fresh session from this point with <code>/branch</code>.
+                  </div>
+                ) : null}
+              </div>
+            );
+          })()}
           {exitInfo && shouldShowExitNotice(exitInfo, state.messages.length) ? (
             <div className="agent-exit-notice">
               {classifyExit(exitInfo, stderr).label}
@@ -282,7 +376,7 @@ export function AgentSessionView({ sessionId, workspacePathCount }: AgentSession
           ) : null}
 
           {/* TODO panel — pinned-bottom checklist when TodoWrite has fired. */}
-          <TodoPanel todos={todos} />
+          <TodoPanel snapshot={todoSnapshot} />
 
           {/* Plan-mode banner — visible whenever Claude reports plan mode. */}
           <PlanModeBanner permissionMode={permissionMode} />
@@ -298,6 +392,21 @@ export function AgentSessionView({ sessionId, workspacePathCount }: AgentSession
           />
         </div>
       </div>
+      {/* The new "agent is working" surface — Margin Draft (rolling
+       *  italic preview) above the Footline (verb · object ·
+       *  chronograph · stop).  Sits OUTSIDE the scroll container so
+       *  it stays anchored at the bottom of the conversation pane
+       *  regardless of where the user has scrolled.  Both components
+       *  render nothing when the agent is idle. */}
+      <MarginDraft state={workingState} />
+      <WorkingFootline
+        state={workingState}
+        onStop={() => {
+          softInterruptAgent(sessionId).catch((err) =>
+            console.warn("[agent] soft-interrupt failed:", err),
+          );
+        }}
+      />
     </div>
   );
 }
@@ -554,20 +663,6 @@ interface NumberedMessage {
   isFirstOfTurn: boolean;
 }
 
-/** Has the (possibly-streaming) assistant message produced any text yet?
- *  When false, the heartbeat cursor has nothing to attach to — that's
- *  exactly when the ThinkingIndicator earns its keep. */
-function hasAnyTextBlock(msg: RenderedMessage | undefined): boolean {
-  if (!msg) return false;
-  for (const b of msg.blocks) {
-    if (isTextBlock(b)) {
-      const t = (b as { text?: string }).text;
-      if (typeof t === "string" && t.length > 0) return true;
-    }
-  }
-  return false;
-}
-
 /**
  * Walk the message list and assign each message a turn number.  A turn
  * starts at every user message and includes all subsequent assistant
@@ -691,6 +786,20 @@ const AgentHeader = memo(function AgentHeader({ state, sessionId, workspacePathC
       </div>
 
       <div className="agent-session-header-meta">
+        <SubagentMastheadChip
+          state={state}
+          onJumpTo={(messageId) => {
+            const el = document.querySelector(
+              `[data-message-id="${CSS.escape(messageId)}"]`,
+            );
+            if (el && "scrollIntoView" in el) {
+              (el as HTMLElement).scrollIntoView({
+                behavior: "smooth",
+                block: "center",
+              });
+            }
+          }}
+        />
         {state.cumulativeOutputTokens > 0 ? (
           <span
             className="agent-session-cost"
@@ -809,6 +918,47 @@ export function classifyExit(
   return { label: "Agent process exited", kind: "exit" };
 }
 
+/* ─── SlashReceiptCard ────────────────────────────────────────────
+ *
+ * Rendered IN PLACE OF the empty assistant message that the
+ * `--print --input-format stream-json` channel emits for receipt-style
+ * slash commands (`/compact`, `/clear`, `/init`, `/review`).  Claude's
+ * reply for these is the literal text `"(no content)"`, which used
+ * to render as a confusing "Hermes: (no content)" turn — leaving the
+ * user wondering whether their command worked.
+ *
+ * The card occupies the same horizontal slot the message would have:
+ * a brass checkmark, a label, and one line of explanatory copy.  Keeps
+ * the speaker chip rendering style consistent with surrounding turns
+ * (data-role / data-first-of-turn) so layout css applies uniformly. */
+function SlashReceiptCard({
+  receipt,
+  isFirstOfTurn,
+}: {
+  receipt: SlashReceipt;
+  isFirstOfTurn: boolean;
+}) {
+  return (
+    <div
+      className="agent-message agent-message-assistant agent-slash-receipt"
+      data-role="assistant"
+      data-first-of-turn={isFirstOfTurn ? "true" : "false"}
+      data-receipt-command={receipt.command}
+    >
+      <div className="agent-message-speaker">
+        <span className="agent-message-speaker-name">Hermes</span>
+      </div>
+      <div className="agent-slash-receipt-card">
+        <span className="agent-slash-receipt-mark" aria-hidden="true">✓</span>
+        <div className="agent-slash-receipt-text">
+          <div className="agent-slash-receipt-label">{receipt.label}</div>
+          <div className="agent-slash-receipt-description">{receipt.description}</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 interface MessageRowProps {
   message: RenderedMessage;
   toolResults: Map<string, ToolResultBlockData>;
@@ -865,6 +1015,7 @@ export function MessageRow({
       className={`agent-message agent-message-${message.role}`}
       data-role={message.role}
       data-first-of-turn={isFirstOfTurn ? "true" : "false"}
+      data-message-id={message.id}
     >
       <div className="agent-message-speaker">
         <span
@@ -1059,8 +1210,42 @@ function BlockRenderer({
     // behaviour under `includePartialMessages: true`), the actual
     // text only ever arrived via `thinking_delta` partials and is
     // now in the streaming accumulator.  Render whichever is non-empty.
-    const fallback = streamingThinkingText?.get(key) ?? "";
-    const effective = block.thinking || fallback;
+    //
+    // We try three fallback strategies in order so a key mismatch
+    // (different message.id between `message_start` and the
+    // consolidated `assistant` event, or out-of-order block indices)
+    // doesn't leave the body blank for the entire turn:
+    //   1) exact key match (`messageId:blockIndex`)
+    //   2) prefix match — any accumulator key that starts with
+    //      `${messageId}:` — handles index mismatch
+    //   3) any non-empty accumulator value — handles total id mismatch
+    let fallback = streamingThinkingText?.get(key) ?? "";
+    if (!fallback && streamingThinkingText) {
+      const prefix = `${messageId}:`;
+      for (const [k, v] of streamingThinkingText) {
+        if (k.startsWith(prefix) && v && v.length > fallback.length) {
+          fallback = v;
+        }
+      }
+    }
+    if (!fallback && streamingThinkingText) {
+      let longest = "";
+      for (const v of streamingThinkingText.values()) {
+        if (v && v.length > longest.length) longest = v;
+      }
+      fallback = longest;
+    }
+    // Prefer whichever source has MORE text — not `block.thinking` first.
+    // Rationale: the SDK fires `thinking_delta` partials at a much higher
+    // frequency than it fires consolidated `assistant` events.  If we
+    // resolved to `block.thinking` whenever it was non-empty, the body
+    // would freeze at the last assistant-event snapshot while the
+    // accumulator silently kept growing — exactly the "body fills late
+    // and then never updates" symptom the user reported with
+    // `display: "summarized"` thinking on Opus 4.7.
+    const blockText = block.thinking ?? "";
+    const effective =
+      fallback.length > blockText.length ? fallback : blockText || fallback;
     const blockToRender =
       effective === block.thinking ? block : { ...block, thinking: effective };
     return (
@@ -1072,12 +1257,16 @@ function BlockRenderer({
     );
   }
   if (isToolUseBlock(block)) {
-    return (
-      <ToolUseBlock
-        block={block as ToolUseBlockData}
-        result={toolResults.get(block.id)}
-      />
-    );
+    const tu = block as ToolUseBlockData;
+    // TaskToolBlock (rendered by ToolUseBlock for the subagent-
+    // spawning tool family) already shows the subagent as a compact
+    // row.  We previously appended `<SubagentList>` here too, but
+    // that double-rendered every subagent: once as the compact row
+    // (TaskToolBlock) and once as an auto-collapsed `N done` rollup
+    // (SubagentList).  Now we only render the parent ToolUseBlock;
+    // aggregate counts still surface via `SubagentMastheadChip` in
+    // the session header.
+    return <ToolUseBlock block={tu} result={toolResults.get(tu.id)} />;
   }
   if (isImageBlock(block)) {
     return <ImageBlock block={block} />;
