@@ -1,9 +1,31 @@
 # ADR 002 — Bridge runtime as a first-launch tarball (v1.2 candidate)
 
-**Status:** Proposed
+**Status:** Accepted (2026-09-27, issue #274)
 **Date:** 2026-05-09
-**Deciders:** TBD
+**Deciders:** gabrielanhaia
 **Supersedes:** the "ship `bridge/node_modules` raw" approach in v1.1.3
+
+## Decisions (accepted 2026-09-27)
+
+Resolving the open questions below:
+
+- **Compression:** zstd, level 19, no `--long` (would need extra decoder
+  settings we don't otherwise carry). Extracted folder name includes both
+  the SDK version and the tarball's sha8 so a repack of the same SDK
+  version still re-extracts. Extraction target is Tauri's
+  `app_local_data_dir()`, not `~/.hermes-ide` — keeps the ~85 MB runtime
+  out of the Windows roaming profile.
+- **GC policy:** current-only, not "latest 2" — a downgrade re-extracts
+  from its own bundled tarball, so keeping older versions around doesn't
+  protect anything. Deferred to the PR2 follow-up (first-launch UX + GC);
+  this PR only adds the extraction path.
+- **AppImage / `latest.json` / release workflow revert** (`--bundles deb`,
+  `downloads.json`, the RELEASE_NOTES.md line): deferred to PR2, so this
+  PR's AppImage fix can be verified in isolation (via `debug-appimage.yml`)
+  before the release pipeline itself changes.
+- **Scope:** split into two PRs shipped in the same release. This PR
+  (PR1) covers the build pipeline, extraction, and bridge spawn path.
+  PR2 covers first-launch UX, GC, and reverting the v1.1.3 workarounds.
 
 ## Context
 
@@ -90,6 +112,23 @@ Detect a user-installed `claude` CLI on PATH; bridge defers to it.
 Go with **Option A** (tarball extract on first launch). Best size reduction, restores AppImage, preserves out-of-the-box UX, no new failure modes that don't already exist (we already write to `~/.hermes-ide/`).
 
 ## Implementation sketch
+
+> **As implemented (PR1, 2026-09-27):** two corrections to the sketch below.
+> `manifest.json` also carries an `entries` map (`{ "@anthropic-ai/claude-agent-sdk": "@anthropic-ai/claude-agent-sdk/sdk.mjs", "zod": "zod/index.js" }`),
+> resolved at pack time via Node's own `import.meta.resolve()` run from
+> inside the bridge dir — not guessed at, since a package's `exports` map
+> can change shape across versions (the SDK's did, 0.2.x → 0.3.x). And
+> **NODE_PATH doesn't affect ESM resolution** (Node ignores it for `import`,
+> only honors it for `require`), so it can't point the bridge at the
+> extracted dir the way this sketch assumed. Instead, the bridge converts
+> its two npm-package imports (`@anthropic-ai/claude-agent-sdk`, `zod`) to
+> dynamic `import()`s: with no `--bridge-runtime-dir` (dev), it imports the
+> bare specifier unchanged; with the flag (production), it reads that
+> dir's `manifest.json` and imports the resolved file directly via
+> `pathToFileURL()`. See `resolveRuntimeModuleSpecifier()` in
+> `bridgeRuntimeHelpers.mjs`. The extraction target is also
+> `app_local_data_dir()/hermes-runtime/${sdkVersion}/`, not
+> `~/.hermes-ide/runtime/`, to keep it out of the Windows roaming profile.
 
 ### Build pipeline
 
