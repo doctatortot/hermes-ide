@@ -463,7 +463,7 @@ describe("importBundle", () => {
 			_hermes_bundle_version: 1,
 			_hermes_app_version: "0.6.4",
 			_hermes_exported_at: "",
-			templates: [makeTemplate({ id: "new-1", name: "New Template" })],
+			templates: [makeTemplate({ id: "new-1", name: "New Template", category: "testing" })],
 			roles: [makeRole({ id: "new-role", label: "New Role" })],
 			styles: [makeStyle({ id: "new-style", label: "New Style" })],
 		};
@@ -544,8 +544,8 @@ describe("importBundle", () => {
 			_hermes_exported_at: "",
 			templates: [
 				makeTemplate({ id: "t1", name: "Template A" }),
-				makeTemplate({ id: "t2", name: "Template B" }),
-				makeTemplate({ id: "t3", name: "Template C" }),
+				makeTemplate({ id: "t2", name: "Template B", category: "testing" }),
+				makeTemplate({ id: "t3", name: "Template C", category: "security" }),
 			],
 			roles: [makeRole()],
 			styles: [makeStyle()],
@@ -570,7 +570,7 @@ describe("importBundle", () => {
 			_hermes_exported_at: "",
 			templates: [
 				makeTemplate({ id: "t1", name: "Template A" }), // duplicate — skip
-				makeTemplate({ id: "t2", name: "Template B" }), // new — add
+				makeTemplate({ id: "t2", name: "Template B", category: "testing" }), // new — add
 			],
 			roles: [],
 			styles: [],
@@ -598,7 +598,7 @@ describe("importBundle", () => {
 			_hermes_exported_at: "",
 			templates: [
 				makeTemplate({ id: "t1", name: "Code Review" }), // matches built-in — skip
-				makeTemplate({ id: "t2", name: "New Template" }), // unique — add
+				makeTemplate({ id: "t2", name: "New Template", category: "testing" }), // unique — add
 			],
 			roles: [],
 			styles: [],
@@ -647,7 +647,7 @@ describe("importBundle", () => {
 			templates: [
 				makeTemplate({ id: "t1", name: "Built-in Template" }), // matches built-in
 				makeTemplate({ id: "t2", name: "User Template" }),     // matches user
-				makeTemplate({ id: "t3", name: "Brand New" }),         // unique
+				makeTemplate({ id: "t3", name: "Brand New", category: "testing" }), // unique
 			],
 			roles: [],
 			styles: [],
@@ -737,6 +737,104 @@ describe("importBundle", () => {
 		// Incoming template renamed and added; its body is preserved
 		expect(templates[1].name).toBe("Shared Name (2)");
 		expect(templates[1].fields?.task).toBe("INCOMING task body — clearly different");
+	});
+
+	it("re-importing the same bundle does not create another renamed copy", () => {
+		// Regression: the incoming template's name never changes across
+		// re-imports of the same bundle, so matching fingerprints only
+		// against same-named existing templates would miss the previously
+		// renamed copy and rename again on every import ("(2)", "(3)", ...).
+		const existing = makeTemplate({
+			id: "ex-1",
+			name: "Shared Name",
+			fields: { roleIds: [], task: "EXISTING task body", scope: "", constraints: "", styleSelections: [], style: "" },
+			recommendedRoles: [],
+			recommendedStyles: [],
+		});
+		const incoming = makeTemplate({
+			id: "in-1",
+			name: "Shared Name",
+			fields: { roleIds: [], task: "INCOMING task body — clearly different", scope: "", constraints: "", styleSelections: [], style: "" },
+			recommendedRoles: [],
+			recommendedStyles: [],
+		});
+		const bundle: PromptBundle = {
+			_hermes_bundle_version: 1,
+			_hermes_app_version: "0.6.4",
+			_hermes_exported_at: "",
+			templates: [incoming],
+			roles: [],
+			styles: [],
+		};
+
+		const first = importBundle(bundle, [existing], [], [], BUILT_IN_ROLE_IDS, BUILT_IN_STYLE_IDS);
+		expect(first.result.templatesRenamed).toBe(1);
+		expect(first.templates.map((t) => t.name)).toEqual(["Shared Name", "Shared Name (2)"]);
+
+		// Re-import the exact same bundle against the post-first-import state.
+		const second = importBundle(bundle, first.templates, [], [], BUILT_IN_ROLE_IDS, BUILT_IN_STYLE_IDS);
+		expect(second.result.templatesAdded).toBe(0);
+		expect(second.result.templatesRenamed).toBe(0);
+		expect(second.result.templatesSkipped).toBe(1);
+		expect(second.templates.map((t) => t.name)).toEqual(["Shared Name", "Shared Name (2)"]);
+	});
+
+	it("reports when a skipped duplicate differs only in roles/styles", () => {
+		// templateFingerprint() deliberately ignores role/style refs (they're
+		// regenerated on every import), so this is a true content duplicate
+		// and gets skipped — but the roles/styles it carries genuinely
+		// differ, and that should be surfaced rather than silently lost.
+		const existing = makeTemplate({ id: "ex-1", name: "Shared Name" }); // default roleIds: ["custom-role-1"]
+		const bundle: PromptBundle = {
+			_hermes_bundle_version: 1,
+			_hermes_app_version: "0.6.4",
+			_hermes_exported_at: "",
+			templates: [
+				makeTemplate({
+					id: "in-1",
+					name: "Shared Name",
+					fields: {
+						roleIds: ["bundle-role"],
+						task: "Fix the bug",
+						scope: "src/",
+						constraints: "",
+						styleSelections: [{ id: "custom-style-1", level: 3 }],
+						style: "",
+					},
+					recommendedRoles: ["bundle-role"],
+					recommendedStyles: [{ id: "custom-style-1", level: 3 }],
+				}),
+			],
+			roles: [makeRole({ id: "bundle-role", label: "A Totally Different Role" })],
+			styles: [],
+		};
+
+		const { result } = importBundle(
+			bundle, [existing], [], [], BUILT_IN_ROLE_IDS, BUILT_IN_STYLE_IDS,
+		);
+
+		expect(result.templatesAdded).toBe(0);
+		expect(result.templatesSkipped).toBe(1);
+		expect(result.templatesSkippedRoleStyleDiff).toBe(1);
+	});
+
+	it("does not flag a skipped duplicate whose roles/styles also match", () => {
+		const existing = makeTemplate({ id: "ex-1", name: "Shared Name" });
+		const bundle: PromptBundle = {
+			_hermes_bundle_version: 1,
+			_hermes_app_version: "0.6.4",
+			_hermes_exported_at: "",
+			templates: [makeTemplate({ id: "in-1", name: "Shared Name" })],
+			roles: [],
+			styles: [],
+		};
+
+		const { result } = importBundle(
+			bundle, [existing], [], [], BUILT_IN_ROLE_IDS, BUILT_IN_STYLE_IDS,
+		);
+
+		expect(result.templatesSkipped).toBe(1);
+		expect(result.templatesSkippedRoleStyleDiff).toBe(0);
 	});
 
 	it("skips silently when name AND content match identically", () => {
