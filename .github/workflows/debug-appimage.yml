@@ -38,6 +38,9 @@ env:
   CARGO_INCREMENTAL: 0
   CARGO_NET_RETRY: 10
   RUSTUP_MAX_RETRIES: 10
+  # SCRATCH DEBUG ONLY: explicit --target makes pkg-config-rs treat this as
+  # cross-compilation even though target == host arch here.
+  PKG_CONFIG_ALLOW_CROSS: "1"
   # Maximum verbosity from Tauri bundler + cargo + AppImage tooling.
   RUST_LOG: "tauri_bundler=trace,info"
   RUST_BACKTRACE: "full"
