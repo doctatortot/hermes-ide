@@ -70,9 +70,9 @@
   align-items: center;
   gap: 10px;
   min-width: 0;
-  overflow: hidden;
-  /* Items inside the title can themselves shrink (cwd path is the
-   * usual culprit); ellipsis happens at the leaf level. */
+  /* No overflow: hidden here — it clips the brass glow on .agent-session-ticker
+   * along the bottom edge.  Children handle their own truncation (the ticker,
+   * cwd label, and model label all set white-space + ellipsis). */
 }
 
 .agent-session-header-title > * {
@@ -129,6 +129,14 @@
   letter-spacing: -0.005em;
   text-shadow: 0 0 8px var(--brass-dim);
   font-size: 13px;
+  line-height: 1.4;
+  /* Keep multi-word labels ("Running Bash", "Awaiting Claude") on a
+   * single line.  Without nowrap the title row would jump to a second
+   * line in narrow panes, causing the whole header to grow and the
+   * surrounding chips to shift on every state change. */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .agent-session-cwd-name {
@@ -299,13 +307,30 @@
   flex: 1 1 auto;
   min-height: 0;
   overflow: auto;
+  /* Reserve the full hover-state scrollbar width so growing the pill on
+   * hover never shifts the conversation column horizontally. */
+  scrollbar-gutter: stable;
 }
 
-/* Brass thin-line scrollbar.  No rail, no chrome — the line itself is the
- * indicator, like a sliding cursor on an instrument scale. */
+/* Brass overlay-style scrollbar.  The 12px track is reserved at all
+ * times via `scrollbar-gutter: stable` on the parent; the visible pill
+ * is rendered via `background-clip: padding-box` inside a transparent
+ * border, so the apparent pill is much thinner than the full track.
+ * Shrinking the border on direct hover grows the pill without touching
+ * the track or causing reflow.
+ *
+ * Two resting states (matches macOS overlay scrollbars):
+ *   - cursor not on the pill      →   6 px pill, 32% brass
+ *   - cursor directly on the pill →  12 px pill, 80% brass
+ *
+ * We intentionally do NOT fatten on container-level hover — that
+ * version (1.3.1) made the pill grow whenever the cursor was anywhere
+ * in the conversation and stay grown until the cursor left the entire
+ * pane, which read as "stuck big".  Direct-hover-only matches the
+ * platform convention and gives the user crisp local feedback. */
 .agent-session-scroll::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+  width: 12px;
+  height: 12px;
 }
 
 .agent-session-scroll::-webkit-scrollbar-track {
@@ -313,15 +338,15 @@
 }
 
 .agent-session-scroll::-webkit-scrollbar-thumb {
-  background: color-mix(in srgb, var(--brass, var(--accent-paper)) 22%, transparent);
-  border-radius: 3px;
-  border: 1px solid transparent;
+  background: color-mix(in srgb, var(--brass, var(--accent-paper)) 32%, transparent);
+  border-radius: 6px;
+  border: 3px solid transparent;
   background-clip: padding-box;
 }
 
 .agent-session-scroll::-webkit-scrollbar-thumb:hover {
-  background: color-mix(in srgb, var(--brass, var(--accent-paper)) 50%, transparent);
-  background-clip: padding-box;
+  background: color-mix(in srgb, var(--brass, var(--accent-paper)) 80%, transparent);
+  border-width: 0;
 }
 
 /* The conversation column.  Left-aligned, not centered — wide monitors
@@ -1555,39 +1580,14 @@ html[data-theme="newsprint"] .agent-md-h2 {
  * 1.06s `step-end` ≈ 57 BPM resting heart rhythm — instant on, instant off.
  * Disappears the instant streaming completes (component prop flips). */
 
-/* Block heartbeat cursor — vintage CRT terminal soul.  Solid amber block
- * (~half-em wide) instead of the thin line.  Pulses on the same 1.06s
- * step-end heartbeat (~57 BPM) and casts a faint matching glow.  This
- * is the single most memorable streaming cue in the agent UI. */
-.agent-cursor {
-  display: inline-block;
-  width: 0.55em;
-  height: 1.1em;
-  background: var(--brass);
-  border-radius: 1px;
-  margin-left: 2px;
-  vertical-align: text-bottom;
-  box-shadow: 0 0 8px var(--brass-dim);
-  animation: agent-cursor-heartbeat 1.06s step-end infinite;
-}
-
-@keyframes agent-cursor-heartbeat {
-  0%,
-  60% {
-    opacity: 1;
-  }
-  61%,
-  100% {
-    opacity: 0;
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .agent-cursor {
-    animation: none;
-    opacity: 1;
-  }
-}
+/* The block heartbeat cursor was retired in 1.2.2.  Once the
+ * WorkingFootline and MarginDraft surfaces took over the
+ * "agent is still writing" job, the cursor had no remaining duty
+ * worth carrying — the growing text itself is the proof of streaming.
+ * See `docs/design/agent-working-experience.html` for the rationale.
+ *
+ * The `.agent-cursor` rule is intentionally absent.  `TextBlock.tsx`
+ * no longer renders the element. */
 
 /* ─── Vintage thinking indicator ──────────────────────────────────
  *
@@ -1823,8 +1823,77 @@ html[data-theme="newsprint"] .agent-md-h2 {
   to   { opacity: 1; transform: translateY(0); }
 }
 
+/* While the model is mid-stream, the chip carries a steady brass dot
+ * that pulses on the same 1.06 s rhythm as the Margin Draft rail.
+ * The caret is replaced by the dot so the chip reads as "live now",
+ * not "collapsible".  When the user clicks open, the caret returns. */
+.agent-thinking-block.live .agent-thinking-caret {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--brass-bright, var(--brass, var(--voice-user)));
+  color: transparent;
+  font-size: 0;
+  animation: thinking-live-pulse 1.06s ease-in-out infinite;
+}
+.agent-thinking-block.live.open .agent-thinking-caret {
+  /* When expanded the caret reappears — the live signal moves into the
+   * body via the trailing pulse, so the header stops being noisy. */
+  width: 8px;
+  height: 8px;
+  border-radius: 0;
+  background: transparent;
+  color: var(--brass, var(--voice-user));
+  font-size: 9px;
+  animation: none;
+}
+@keyframes thinking-live-pulse {
+  0%, 100% { opacity: 0.45; transform: scale(0.85); }
+  50%      { opacity: 1;    transform: scale(1.1); }
+}
+
+/* "click to read" affordance on collapsed live blocks. */
+.agent-thinking-hint {
+  font: var(--text-2xs)/1 var(--font-code);
+  font-style: italic;
+  color: var(--text-3);
+  margin-left: var(--space-1);
+  padding-left: var(--space-2);
+  border-left: 1px solid color-mix(in srgb, var(--brass, var(--voice-user)) 22%, transparent);
+  letter-spacing: var(--tracking-normal);
+  opacity: 0.85;
+}
+
+/* Placeholder shown when a live block is open but no deltas have
+ * arrived yet — keeps the surface from looking broken in the first
+ * second of streaming. */
+.agent-thinking-placeholder {
+  display: inline-block;
+  color: var(--text-3);
+  font-style: italic;
+  opacity: 0.7;
+}
+
+/* Trailing pulse cursor at the tail of streaming thinking text. */
+.agent-thinking-pulse {
+  display: inline-block;
+  width: 6px;
+  height: 1em;
+  margin-left: 3px;
+  vertical-align: text-bottom;
+  background: var(--brass-bright, var(--brass, var(--voice-user)));
+  opacity: 0.6;
+  animation: thinking-pulse-blink 1.06s ease-in-out infinite;
+}
+@keyframes thinking-pulse-blink {
+  0%, 100% { opacity: 0.15; }
+  50%      { opacity: 0.75; }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .agent-thinking-body { animation: none; }
+  .agent-thinking-block.live .agent-thinking-caret { animation: none; }
+  .agent-thinking-pulse { animation: none; opacity: 0.4; }
 }
 
 /* ─── Tool families (v1 redesign — playbook §5) ─────────────
@@ -2556,6 +2625,97 @@ html[data-theme="newsprint"] .agent-md-h2 {
   background: transparent;
 }
 
+/* Slash-command receipt card — replaces the "(no content)" placeholder
+ * Claude emits for /compact, /clear, /init, /review.  Brass checkmark
+ * + one-line label + one-line description, sized like a quiet status
+ * banner rather than a full message body so the user reads it as
+ * "the action succeeded" not "here's a reply". */
+.agent-slash-receipt-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 14px;
+  border: 1px solid color-mix(
+    in srgb,
+    var(--brass, var(--accent-paper)) 28%,
+    transparent
+  );
+  border-left-width: 3px;
+  border-radius: 6px;
+  background: color-mix(
+    in srgb,
+    var(--brass, var(--accent-paper)) 6%,
+    transparent
+  );
+}
+.agent-slash-receipt-mark {
+  flex: 0 0 auto;
+  font: var(--weight-bold) var(--text-sm) / 1 var(--mono);
+  color: var(--brass-bright, var(--brass, var(--accent-paper)));
+  /* Lift the check so it baseline-aligns with the label, not its mid-x. */
+  padding-top: 1px;
+}
+.agent-slash-receipt-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.agent-slash-receipt-label {
+  font: var(--weight-semibold) var(--text-sm) / 1.3 var(--font-ui);
+  color: var(--text-0);
+}
+.agent-slash-receipt-description {
+  font: var(--text-xs) / 1.5 var(--font-ui);
+  color: var(--text-2);
+}
+
+/* Result-event error banner — Claude returned `is_error: true` (e.g.
+ * "prompt is too long").  Distinct from the agent-exit-notice strip:
+ * exit-notice fires on non-zero subprocess exit codes, this fires
+ * when the subprocess exited cleanly (code 0) but the result payload
+ * carried a hard error from the upstream API.  See errorSelector.ts. */
+.agent-result-error {
+  margin: 12px 0;
+  padding: 12px 14px;
+  border: 1px solid var(--danger, var(--red, var(--tool-error)));
+  border-left-width: 3px;
+  border-radius: 6px;
+  background: color-mix(
+    in srgb,
+    var(--danger, var(--red, var(--tool-error))) 8%,
+    transparent
+  );
+}
+.agent-result-error-title {
+  font: var(--weight-semibold) var(--text-sm) / 1.2 var(--font-ui);
+  color: var(--danger, var(--red, var(--tool-error)));
+  margin-bottom: 6px;
+  letter-spacing: 0.01em;
+}
+.agent-result-error-body {
+  margin: 0 0 8px;
+  font: var(--text-xs) / 1.4 var(--mono);
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text-1);
+}
+.agent-result-error-hint {
+  font: var(--text-xs) / 1.5 var(--font-ui);
+  color: var(--text-2);
+}
+.agent-result-error-hint code {
+  font-family: var(--mono);
+  padding: 0 4px;
+  border-radius: 3px;
+  background: color-mix(
+    in srgb,
+    var(--brass, var(--accent-paper)) 14%,
+    transparent
+  );
+  color: var(--brass-bright, var(--brass, var(--accent-paper)));
+}
+
 /* Inline action on the exit notice (e.g. "Start fresh from here").  Quiet
  * brass-tinted button — never the dominant element on the surface. */
 .agent-exit-action {
@@ -2763,4 +2923,826 @@ html[data-agent-timeline-style="classic"]
 
 html[data-agent-timeline-style="classic"] .agent-message {
   max-width: none;
+}
+
+/* =====================================================================
+ * TaskToolBlock — the subagent-spawning tool's parent card.
+ *
+ * Replaces GenericToolBlock for Task / agent / agent_dispatch.  Shows
+ * the agent's reply cleanly with a quiet metadata strip; clicking
+ * the strip reveals the raw result for deeper inspection.
+ * ===================================================================== */
+
+/* TaskToolBlock — collapsed-by-default compact row matching the
+ * SubagentList density.  Click the row to expand the reply + metadata.
+ *
+ * Entrance: each block fades in + slides up on mount.  Tasks appear
+ * as Claude streams them, so a soft 180ms reveal reads as the surface
+ * adapting rather than React reflowing.  Pairs with the IDE's
+ * existing motion vocabulary (`--ease-out-expo` style curve). */
+.agent-task-block {
+  margin: 4px 0;
+  border-radius: 4px;
+  background: transparent;
+  font-style: normal;
+  animation: agent-task-block-in 220ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@keyframes agent-task-block-in {
+  from {
+    opacity: 0;
+    transform: translateY(3px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .agent-task-block { animation: none; }
+}
+
+.agent-task-block-row {
+  display: grid;
+  grid-template-columns: 12px 8px auto 1fr auto;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  width: 100%;
+  text-align: left;
+  font: var(--text-base) / var(--leading-snug) var(--font-ui);
+  color: var(--text-1);
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+.agent-task-block-row:hover {
+  background: var(--bg-2);
+}
+.agent-task-block[data-expanded="true"] .agent-task-block-row {
+  background: var(--bg-2);
+  border-color: var(--rule);
+}
+.agent-task-block[data-status="done"] .agent-task-block-row {
+  opacity: 0.85;
+}
+
+.agent-task-block-chev {
+  font-size: 10px;
+  color: var(--text-3);
+}
+
+.agent-task-block-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.agent-task-block-dot[data-status="running"] {
+  background: var(--voice-agent, var(--accent));
+  box-shadow: 0 0 5px var(--voice-agent, var(--accent));
+  animation: agent-subagent-pulse 1.4s ease-in-out infinite;
+}
+.agent-task-block-dot[data-status="done"] {
+  background: var(--success, var(--green));
+}
+.agent-task-block-dot[data-status="error"] {
+  background: var(--danger, var(--red));
+}
+
+.agent-task-block-label {
+  font: var(--weight-semibold) var(--text-2xs) / 1 var(--mono);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--brass-bright, var(--accent));
+  padding-right: 4px;
+}
+
+.agent-task-block-name {
+  font-weight: var(--weight-semibold);
+  color: var(--text-0);
+  font-size: var(--text-base);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.agent-task-block-spacer {
+  /* flex filler — pushes status to the right */
+}
+
+/* Status descriptor: editorial register.
+ *   "done" / "running" / "thinking"  →  italic Newsreader
+ *   "12s" / "9.0s"                   →  JetBrains Mono, tabular nums
+ * The hybrid reads as an instrument with editorial captions — same
+ * voice as the workshop masthead. */
+.agent-task-block-status {
+  font-family: var(--font-serif, var(--mono));
+  font-style: italic;
+  font-size: var(--text-base);
+  letter-spacing: 0;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.agent-task-block-status::before {
+  /* Pseudo-element separator handled inline via `·` in the
+   * statusLabel string; nothing needed here. */
+}
+.agent-task-block-status[data-status="running"] {
+  color: var(--voice-agent, var(--accent));
+}
+.agent-task-block-status[data-status="done"] {
+  color: var(--success, var(--green));
+}
+.agent-task-block-status[data-status="error"] {
+  color: var(--danger, var(--red));
+}
+
+.agent-task-block-body {
+  /* Position is relative so we can paint a 1px brass connector from
+   * the row's dot down into the body's left rail.  The connector
+   * threads the dot → body visually as one continuous instrument. */
+  position: relative;
+  margin: 0 0 6px 18px;
+  padding: 10px 14px;
+  border-left: 2px solid var(--voice-agent, var(--accent));
+  background: var(--bg-2);
+  border-radius: 0 4px 4px 0;
+  animation: agent-task-body-in 200ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+/* Brass thread from the row's dot down to the body rail. */
+.agent-task-block-body::before {
+  content: "";
+  position: absolute;
+  top: -6px;
+  left: -2px;
+  width: 2px;
+  height: 8px;
+  background: linear-gradient(180deg, var(--brass, var(--accent)), var(--voice-agent, var(--accent)));
+  opacity: 0.45;
+}
+
+@keyframes agent-task-body-in {
+  from {
+    opacity: 0;
+    max-height: 0;
+    padding-top: 0;
+    padding-bottom: 0;
+  }
+  to {
+    opacity: 1;
+    max-height: 600px;
+    padding-top: 10px;
+    padding-bottom: 10px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .agent-task-block-body { animation: none; }
+}
+
+.agent-task-block-reply {
+  font: var(--text-md) / var(--leading-relaxed) var(--font-ui);
+  color: var(--text-1);
+}
+.agent-task-block-reply > :first-child { margin-top: 0; }
+.agent-task-block-reply > :last-child { margin-bottom: 0; }
+
+.agent-task-block-empty {
+  margin: 0;
+  font-style: italic;
+  color: var(--text-3);
+  font-size: var(--text-base);
+}
+
+.agent-task-block-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px dotted var(--rule);
+  font-family: var(--mono);
+  font-size: var(--text-xs);
+  letter-spacing: 0.04em;
+  color: var(--text-3);
+}
+.agent-task-block-meta-sep {
+  width: 1px;
+  height: 9px;
+  background: var(--rule-strong, var(--rule));
+}
+.agent-task-block-meta-label {
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  font-weight: var(--weight-semibold);
+  color: var(--text-3);
+}
+.agent-task-block-meta-id {
+  font-family: var(--mono);
+  color: var(--text-2);
+  font-size: var(--text-xs);
+}
+
+/* =====================================================================
+ * Subagents — compact rows under a Task tool_use block.
+ *
+ * Anatomy:
+ *   .agent-subagent-list           — the container (sits below ToolUseBlock)
+ *     .agent-subagent-row          — one compact row per subagent
+ *       .agent-subagent-chev       — collapse/expand glyph
+ *       .agent-subagent-dot        — state indicator (thinking/running/done)
+ *       .agent-subagent-name       — task description or "subagent #N"
+ *       .agent-subagent-elapsed    — live counter / frozen "done · Xs"
+ *       .agent-subagent-nested     — (+N) running-descendants hint
+ *     .agent-subagent-expanded     — body shown when a row is open
+ *     .agent-subagent-rollup       — "▸ N done" line for auto-collapsed rows
+ *
+ * See `docs/superpowers/specs/2026-05-12-subagent-visibility-design.md`.
+ * ===================================================================== */
+
+.agent-subagent-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin-top: 4px;
+  padding: 4px 0 0;
+  border-top: 1px dashed var(--rule);
+}
+
+.agent-subagent-row {
+  display: grid;
+  grid-template-columns: 12px 8px 1fr auto auto;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  width: 100%;
+  text-align: left;
+  font: var(--text-base) / var(--leading-snug) var(--font-ui);
+  color: var(--text-1);
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+
+.agent-subagent-row:hover {
+  background: var(--bg-2);
+}
+
+.agent-subagent-row[data-expanded="true"] {
+  background: var(--bg-2);
+  border-color: var(--rule);
+}
+
+.agent-subagent-row[data-state="done"] {
+  opacity: 0.7;
+}
+
+.agent-subagent-chev {
+  font-size: 10px;
+  color: var(--text-3);
+}
+
+.agent-subagent-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.agent-subagent-dot[data-state="thinking"] {
+  background: var(--voice-agent);
+  box-shadow: 0 0 5px var(--voice-agent);
+  animation: agent-subagent-pulse 1.4s ease-in-out infinite;
+}
+.agent-subagent-dot[data-state="running"] {
+  background: var(--success, var(--green));
+  box-shadow: 0 0 5px var(--success, var(--green));
+}
+.agent-subagent-dot[data-state="done"] {
+  background: var(--text-3);
+}
+@keyframes agent-subagent-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.55; }
+}
+
+.agent-subagent-name {
+  font-weight: var(--weight-semibold);
+  color: var(--text-0);
+  font-size: var(--text-base);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.agent-subagent-spacer {
+  /* Flex spacer column — keeps elapsed + nested aligned right. */
+}
+
+.agent-subagent-elapsed {
+  font-family: var(--mono);
+  font-size: var(--text-xs);
+  color: var(--text-3);
+  letter-spacing: 0.04em;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.agent-subagent-elapsed[data-state="done"] {
+  color: var(--success, var(--green));
+}
+
+.agent-subagent-nested {
+  font-family: var(--mono);
+  font-size: var(--text-xs);
+  color: var(--brass, var(--accent));
+  letter-spacing: 0.04em;
+  font-weight: var(--weight-semibold);
+}
+
+.agent-subagent-expanded {
+  padding: 10px 14px 12px;
+  margin: 0 0 4px 18px;
+  border-left: 2px solid var(--voice-agent, var(--accent));
+  background: var(--bg-2);
+  border-radius: 0 4px 4px 0;
+  font-size: var(--text-base);
+}
+
+.agent-subagent-empty {
+  font-style: italic;
+  color: var(--text-3);
+  margin: 0;
+}
+
+.agent-subagent-transcript-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 8px;
+  padding: 2px 0;
+  background: transparent;
+  border: none;
+  color: var(--brass, var(--accent));
+  font: var(--text-xs) / 1 var(--mono);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  font-weight: var(--weight-semibold);
+  cursor: pointer;
+}
+.agent-subagent-transcript-link:hover {
+  color: var(--brass-bright, var(--accent));
+}
+
+.agent-subagent-rollup {
+  margin-top: 2px;
+}
+.agent-subagent-rollup-toggle {
+  background: transparent;
+  border: none;
+  color: var(--text-3);
+  font: var(--text-xs) / 1 var(--mono);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  font-weight: var(--weight-semibold);
+  padding: 4px 10px;
+  cursor: pointer;
+}
+.agent-subagent-rollup-toggle:hover {
+  color: var(--text-1);
+}
+.agent-subagent-rollup-count {
+  color: var(--brass, var(--accent));
+  font-weight: var(--weight-bold);
+}
+.agent-subagent-rollup-list {
+  margin-top: 2px;
+}
+
+.agent-subagent-transcript {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  font: var(--text-md) / var(--leading-relaxed) var(--font-ui);
+  color: var(--text-1);
+}
+.agent-subagent-transcript-msg[data-role="user"] {
+  padding-left: 12px;
+  border-left: 2px solid var(--voice-user, var(--accent));
+}
+.agent-subagent-transcript-msg[data-role="assistant"] {
+  padding-left: 12px;
+  border-left: 2px solid var(--voice-agent, var(--accent));
+}
+.agent-subagent-transcript-tool {
+  margin-top: 4px;
+  font-family: var(--mono);
+  font-size: var(--text-xs);
+  color: var(--text-3);
+}
+.agent-subagent-transcript-tool-name {
+  padding: 1px 6px;
+  border: 1px solid var(--rule);
+  border-radius: 3px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.agent-subagent-transcript-thinking {
+  font-family: var(--serif);
+  font-size: var(--text-base);
+  color: var(--text-2);
+  font-style: italic;
+}
+
+/* ── Masthead chip + popover ───────────────────────────────────────── */
+
+.agent-subagent-chip-wrap {
+  position: relative;
+  display: inline-flex;
+  animation: agent-subagent-chip-in 240ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@keyframes agent-subagent-chip-in {
+  from {
+    opacity: 0;
+    transform: translateY(-2px) scale(0.92);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .agent-subagent-chip-wrap { animation: none; }
+}
+
+.agent-subagent-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border: 1px solid var(--rule-strong, var(--rule));
+  background: var(--brass-dim, var(--bg-2));
+  color: var(--brass-bright, var(--accent));
+  border-radius: 999px;
+  font: var(--weight-semibold) var(--text-xs) / 1 var(--mono);
+  letter-spacing: 0.06em;
+  cursor: pointer;
+  text-transform: lowercase;
+  transition: border-color 160ms ease, background 160ms ease;
+}
+.agent-subagent-chip:hover {
+  border-color: var(--brass, var(--accent));
+}
+.agent-subagent-chip-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--brass-bright, var(--accent));
+  box-shadow: 0 0 6px var(--brass, var(--accent));
+  animation: agent-subagent-pulse 1.4s ease-in-out infinite;
+}
+.agent-subagent-chip-count {
+  font-weight: var(--weight-bold);
+  font-variant-numeric: tabular-nums;
+}
+.agent-subagent-chip-label {
+  color: var(--text-2);
+}
+.agent-subagent-chip-chev {
+  color: var(--text-3);
+  font-size: 9px;
+  margin-left: 2px;
+}
+
+.agent-subagent-popover {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 200;
+  min-width: 280px;
+  max-width: 360px;
+  /* Solid floating-panel surface.  Matches every other popover in the
+   * app (`.commands-popover`, `.status-theme-popover`, `.color-picker-popover`),
+   * which all sit on `--bg-1` / `--bg-2` rather than `--bg-elevated`.
+   * `--bg-2` gives a reliable tonal lift above both the header (`--bg-0`)
+   * and the conversation surface (`--bg-1`) on every theme, so the
+   * popover no longer reads as part of the page in warm-toned palettes.
+   * Frosted themes get an Apple-HUD glass override in `themes.css`. */
+  background: var(--bg-2);
+  border: 1px solid var(--rule-strong, var(--rule));
+  border-radius: 8px;
+  box-shadow:
+    0 1px 0 rgba(255, 246, 222, 0.04) inset,
+    0 24px 60px -16px rgba(0, 0, 0, 0.65),
+    0 0 0 1px rgba(0, 0, 0, 0.35);
+  padding: 10px;
+  transform-origin: top right;
+  animation: agent-subagent-popover-in 180ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@keyframes agent-subagent-popover-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .agent-subagent-popover { animation: none; }
+}
+.agent-subagent-popover-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  padding: 0 4px 8px;
+  border-bottom: 1px solid var(--rule-hair);
+  margin-bottom: 6px;
+}
+.agent-subagent-popover-kicker {
+  font: var(--weight-bold) var(--text-2xs) / 1 var(--mono);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--brass-bright, var(--accent));
+}
+.agent-subagent-popover-meta {
+  font: var(--text-xs) / 1 var(--mono);
+  color: var(--text-3);
+  letter-spacing: 0.04em;
+}
+.agent-subagent-popover-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.agent-subagent-popover-row {
+  display: grid;
+  grid-template-columns: 8px 1fr auto auto;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  text-align: left;
+  cursor: pointer;
+  font: var(--text-base) / 1.3 var(--font-ui);
+  color: var(--text-1);
+  transition: background 120ms ease;
+}
+.agent-subagent-popover-row:hover {
+  background: var(--bg-2);
+}
+.agent-subagent-popover-name {
+  font-weight: var(--weight-medium);
+  color: var(--text-0);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+.agent-subagent-popover-spacer {
+  /* flex filler */
+}
+.agent-subagent-popover-elapsed {
+  font-family: var(--mono);
+  font-size: var(--text-xs);
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+
+/* =====================================================================
+ * WorkingFootline + MarginDraft — the new "agent is working" surface.
+ *
+ * Two stacked rows that sit above the composer whenever the agent is
+ * non-idle.  Together they replace what the legacy ThinkingIndicator
+ * + brass cursor block + status-bar ticker were trying to do, with
+ * editorial typography and a single sustained motion primitive (a
+ * brass hairline pulse on the Margin Draft rail at 1.06s).
+ *
+ * See `docs/design/agent-working-experience.html`.
+ * ===================================================================== */
+
+/* ── Margin Draft (sits ABOVE the Footline) ────────────────────────── */
+.agent-margin-draft {
+  position: relative;
+  /* Generous vertical padding so italic Newsreader's ascenders +
+   * descenders aren't clipped on a single-line render.  Calculation:
+   * line-height 1.6 × font-size 14 = 22.4px per line; with the 6px
+   * inter-line gap, two lines need ≈51px of content height.  Plus
+   * 14px top + 14px bottom padding = ~80px floor. */
+  padding: 14px 16px 14px 28px;
+  border-top: 1px solid var(--rule-hair);
+  background: rgba(20, 18, 15, 0.92);
+  /* Reserve enough room for TWO lines of italic body text — the
+   * previous 56px floor only fit ~1.2 lines, which is why the second
+   * line's descenders were being clipped at the bottom of the
+   * container in the screenshot. */
+  min-height: 82px;
+  overflow: visible;
+  /* CRITICAL: in the parent flex column (agent-session-view), items
+   * default to flex-shrink:1.  With a tall scroll area above, the
+   * MarginDraft was being compressed to fit, silently clipping its
+   * second line.  flex-shrink:0 pins its measured height. */
+  flex: 0 0 auto;
+  /* Stack <p> lines with breathing room — without this gap the second
+   * line sits flush against the first, which makes the Footline verb
+   * just below appear to touch the body text. */
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.agent-margin-draft::before {
+  content: "";
+  position: absolute;
+  left: 14px;
+  top: 14px;
+  bottom: 14px;
+  width: 1.5px;
+  background: var(--brass);
+  border-radius: 1px;
+  animation: agent-margin-draft-pulse 1.06s ease-in-out infinite;
+}
+@keyframes agent-margin-draft-pulse {
+  0%, 100% { opacity: 0.32; }
+  50%      { opacity: 0.9; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .agent-margin-draft::before { animation: none; opacity: 0.6; }
+}
+.agent-margin-draft-line {
+  font-family: var(--font-serif, "Newsreader", Georgia, serif);
+  font-style: italic;
+  font-size: var(--text-md);
+  line-height: 1.6;
+  letter-spacing: 0;
+  color: var(--text-2);
+  margin: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.agent-margin-draft-line.fresh {
+  color: var(--text-1);
+}
+
+/* "responding to:" prefix used by the user-prompt fallback.  The
+ * prefix is read as a label, the body as italic prose — same
+ * editorial register as the rest of the IDE's kickers. */
+.agent-margin-draft-line .agent-margin-draft-prefix {
+  font-family: var(--mono);
+  font-style: normal;
+  font-size: var(--text-2xs);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  font-weight: 700;
+  color: var(--brass-bright, var(--accent));
+  margin-right: 8px;
+  opacity: 0.75;
+}
+
+/* ── Footline ──────────────────────────────────────────────────────── */
+.agent-footline {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 10px 22px;
+  background:
+    linear-gradient(180deg, rgba(184, 134, 42, 0.0), rgba(184, 134, 42, 0.05)),
+    rgba(20, 18, 15, 0.92);
+  border-top: 1px solid var(--rule-hair);
+  border-bottom: 1px solid var(--rule);
+  /* Same flex-shrink:0 rationale as MarginDraft — keep the chrome
+   * pinned at its natural height regardless of how tall the scroll
+   * area above grows. */
+  flex: 0 0 auto;
+}
+.agent-footline[data-variant="stopping"] {
+  background:
+    repeating-linear-gradient(
+      45deg,
+      rgba(201, 87, 63, 0.05) 0 4px,
+      transparent 4px 8px
+    ),
+    linear-gradient(180deg, rgba(201, 87, 63, 0.0), rgba(201, 87, 63, 0.06));
+}
+.agent-footline[data-variant="waiting"] {
+  background: rgba(255, 179, 64, 0.06);
+}
+
+.agent-footline-verb-block {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+.agent-footline-verb {
+  font-family: var(--font-serif, "Newsreader", Georgia, serif);
+  font-style: italic;
+  font-size: var(--text-md);
+  font-weight: 400;
+  color: var(--brass-bright, var(--accent));
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+}
+.agent-footline[data-variant="stopping"] .agent-footline-verb {
+  color: var(--danger, var(--red));
+}
+.agent-footline[data-variant="waiting"] .agent-footline-verb {
+  color: #ffb340;
+}
+
+.agent-footline-object {
+  font-family: var(--mono);
+  font-size: var(--text-sm);
+  color: var(--text-2);
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+.agent-footline-object-path {
+  color: var(--text-0);
+  font-weight: var(--weight-medium, 500);
+}
+.agent-footline-object-alt {
+  font-family: var(--font-serif, "Newsreader", Georgia, serif);
+  font-style: italic;
+  font-size: var(--text-base);
+  color: var(--text-3);
+}
+
+.agent-footline-spacer {
+  flex: 0 1 auto;
+}
+
+.agent-footline-meter {
+  font-family: var(--mono);
+  font-size: var(--text-xs);
+  letter-spacing: 0.04em;
+  font-variant-numeric: tabular-nums;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-3);
+  flex-shrink: 0;
+}
+.agent-footline-elapsed,
+.agent-footline-tokens {
+  color: var(--text-1);
+}
+.agent-footline-sep {
+  color: var(--text-4, var(--rule-strong));
+}
+.agent-footline-stop {
+  appearance: none;
+  background: transparent;
+  border: 1px solid var(--rule-strong, var(--rule));
+  color: var(--text-2);
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  font-weight: 700;
+  padding: 4px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  transition: border-color 180ms ease, color 180ms ease;
+}
+.agent-footline-stop:hover {
+  border-color: var(--danger, var(--red));
+  color: var(--danger, var(--red));
+}
+.agent-footline-stop-esc {
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  text-transform: lowercase;
+  font-weight: 500;
+  color: var(--text-3);
+}
+
+/* When the footline is in its stopping state, dim the Stop button —
+ * it has already been pressed; clicking again is no-op. */
+.agent-footline[data-variant="stopping"] .agent-footline-stop {
+  border-color: var(--danger, var(--red));
+  color: var(--danger, var(--red));
+  opacity: 0.6;
+  cursor: default;
 }

@@ -6,7 +6,7 @@ use std::thread;
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
-use crate::db::ExecutionNode;
+use crate::db::{Database, ExecutionNode, SessionWorktreeRow};
 use crate::pty::adapters::now;
 use crate::pty::analyzer::{CommandPredictionEvent, OutputAnalyzer};
 use crate::pty::models::*;
@@ -1071,6 +1071,17 @@ pub fn create_session(
                         break;
                     }
                     Ok(n) => {
+                        // Session was closed but something still holds the PTY
+                        // open (e.g. a TUI that ignored SIGHUP).  Stop reading so
+                        // we never re-announce a closed session; exiting also
+                        // drops our master fd so the kernel hangs up the PTY.
+                        if session_clone
+                            .lock()
+                            .map(|s| s.phase == SessionPhase::Destroyed)
+                            .unwrap_or(false)
+                        {
+                            break;
+                        }
                         let data = &buf[..n];
 
                         // Declare outside analyzer lock scope so DB work can
@@ -1103,7 +1114,7 @@ pub fn create_session(
 
                             if let Some(new_phase) = a.take_pending_phase() {
                                 if let Ok(mut s) = session_clone.lock() {
-                                    if s.phase != new_phase {
+                                    if s.phase.can_transition_to(&new_phase) {
                                         s.phase = new_phase.clone();
                                         s.last_activity_at = now();
                                         s.detected_agent = a.detected_agent.clone();
@@ -1133,20 +1144,14 @@ pub fn create_session(
                             // is the lightweight field that actually changed.
                             if a.detected_agent.is_some() {
                                 if let Ok(mut s) = session_clone.lock() {
-                                    if s.detected_agent.is_none() {
+                                    if agent_model_needs_emit(&s.detected_agent, &a.detected_agent)
+                                    {
+                                        if s.detected_agent.is_none() {
+                                            s.last_activity_at = now();
+                                        }
                                         s.detected_agent = a.detected_agent.clone();
-                                        s.last_activity_at = now();
                                         let update = SessionUpdate::from(&*s);
                                         let _ = app_clone.emit("session-updated", &update);
-                                    } else if let (Some(ref sa), Some(ref aa)) =
-                                        (&s.detected_agent, &a.detected_agent)
-                                    {
-                                        // Model enrichment: agent detected but model was unknown, now resolved
-                                        if sa.model.is_none() && aa.model.is_some() {
-                                            s.detected_agent = a.detected_agent.clone();
-                                            let update = SessionUpdate::from(&*s);
-                                            let _ = app_clone.emit("session-updated", &update);
-                                        }
                                     }
                                 }
                             }
@@ -1535,7 +1540,7 @@ pub fn create_session(
                 if let Some((new_phase, detected_agent, metrics, launch_info)) = silence_result {
                     if let Some(new_phase) = new_phase {
                         if let (Some(metrics), Ok(mut s)) = (metrics, session_silence.lock()) {
-                            if s.phase != new_phase {
+                            if s.phase.can_transition_to(&new_phase) {
                                 s.phase = new_phase.clone();
                                 s.detected_agent = detected_agent;
                                 s.metrics = metrics;
@@ -1735,33 +1740,47 @@ pub fn write_to_session(
     if let Ok(mut a) = session.analyzer.lock() {
         a.mark_input_sent();
 
-        let text = String::from_utf8_lossy(&bytes);
-        let is_enter = text.contains('\r') || text.contains('\n');
+        // While a TUI owns the screen (vim, less, htop, claude, etc.) the
+        // line buffer must stay quiescent. Keystrokes typed at a TUI are
+        // application input, not shell commands, and recording them would
+        // pollute the execution-node stream and feed garbage into the
+        // command-prediction system (issue #172).
+        if !a.in_alternate_screen {
+            let text = String::from_utf8_lossy(&bytes);
+            let is_enter = text.contains('\r') || text.contains('\n');
 
-        // Accumulate printable chars into the line buffer
-        for ch in text.chars() {
-            if ch == '\r' || ch == '\n' {
-                // Enter pressed — commit the accumulated line
-                continue;
-            } else if ch == '\x7f' || ch == '\x08' {
-                // Backspace — pop last char
-                a.input_line_buffer.pop();
-            } else if ch == '\x03' {
-                // Ctrl+C — clear buffer
-                a.input_line_buffer.clear();
-            } else if !ch.is_control() {
-                a.input_line_buffer.push(ch);
+            // Accumulate printable chars into the line buffer
+            for ch in text.chars() {
+                if ch == '\r' || ch == '\n' {
+                    // Enter pressed — commit the accumulated line
+                    continue;
+                } else if ch == '\x7f' || ch == '\x08' {
+                    // Backspace — pop last char
+                    a.input_line_buffer.pop();
+                } else if ch == '\x03' {
+                    // Ctrl+C — clear buffer
+                    a.input_line_buffer.clear();
+                } else if !ch.is_control() {
+                    a.input_line_buffer.push(ch);
+                }
             }
-        }
 
-        if is_enter && !a.input_line_buffer.is_empty() {
-            let line = a.input_line_buffer.drain(..).collect::<String>();
-            a.mark_input_line(&line);
-            let cwd = a.current_cwd.clone().unwrap_or_default();
-            a.start_node(&cwd);
-        } else if is_enter {
-            // Enter with empty buffer — still mark activity
-            a.input_line_buffer.clear();
+            if is_enter && !a.input_line_buffer.is_empty() {
+                let line = a.input_line_buffer.drain(..).collect::<String>();
+                a.mark_input_line(&line);
+                let cwd = a.current_cwd.clone().unwrap_or_default();
+                a.start_node(&cwd);
+            } else if is_enter {
+                // Enter with empty buffer — still mark activity
+                a.input_line_buffer.clear();
+            }
+        } else {
+            // Defensive: a TUI may launch mid-line. Any half-typed shell
+            // command in the buffer at that point isn't a real command —
+            // drop it so we don't commit it on the next post-TUI Enter.
+            if !a.input_line_buffer.is_empty() {
+                a.input_line_buffer.clear();
+            }
         }
     }
 
@@ -2015,6 +2034,154 @@ pub fn resize_session(
     Ok(())
 }
 
+/// Whether the analyzer's agent info should be pushed to the session and
+/// emitted: first detection, or any model change (None→Some and Some(a)→Some(b),
+/// e.g. `/model sonnet` → `/model opus`).
+fn agent_model_needs_emit(current: &Option<AgentInfo>, detected: &Option<AgentInfo>) -> bool {
+    match (current, detected) {
+        (None, Some(_)) => true,
+        (Some(cur), Some(new)) => new.model.is_some() && cur.model != new.model,
+        _ => false,
+    }
+}
+
+/// Drain the DB-side state for `session_id`: mark the session as
+/// destroyed, clean up session-scoped pins, and dispose of every linked
+/// worktree row that does NOT require filesystem removal (main worktrees
+/// + worktrees still referenced by another session — i.e. shared).
+///
+/// Returns the remaining worktree rows that DO require `git worktree
+/// remove`; the caller is responsible for running disk removal and then
+/// calling `delete_session_worktree` for each row that was successfully
+/// removed.  Failed disk removals leave their rows in place so they can
+/// be retried on next startup.
+///
+/// This helper is mode-agnostic: it runs for both terminal and agent
+/// sessions.  Bug 1 (1.2.x): before this extraction, every line of
+/// close-time cleanup sat inside `if let Some(_) = mgr.sessions.remove(...)`,
+/// which is always `None` for agent sessions — so worktrees, DB rows,
+/// pins, and status updates all leaked on agent close.
+pub fn drain_session_db_state(db: &Database, session_id: &str) -> Vec<SessionWorktreeRow> {
+    // Status + pin cleanup are best-effort: an UPDATE against a missing
+    // session row is a no-op, and pin cleanup just returns 0.  We swallow
+    // errors here so a single failure doesn't block the worktree pass.
+    let _ = db.update_session_status(session_id, "destroyed");
+    let _ = db.cleanup_session_pins(session_id);
+
+    let worktrees = match db.get_session_worktrees(session_id) {
+        Ok(rows) => rows,
+        Err(e) => {
+            log::warn!(
+                "drain_session_db_state: get_session_worktrees('{}') failed: {}",
+                session_id,
+                e,
+            );
+            return Vec::new();
+        }
+    };
+
+    let mut needs_disk_removal: Vec<SessionWorktreeRow> = Vec::new();
+
+    for wt in worktrees {
+        if wt.is_main_worktree {
+            // Main worktrees live in the project repo itself; close must
+            // never remove them from disk.  Drop the link row.
+            if let Err(e) = db.delete_session_worktree(&wt.id) {
+                log::warn!("Failed to delete main-worktree DB row '{}': {}", wt.id, e,);
+            }
+            continue;
+        }
+
+        let ref_count = db
+            .count_sessions_for_worktree_path(&wt.worktree_path)
+            .unwrap_or(1);
+        if ref_count > 1 {
+            // Another session still references this path — drop our row
+            // only, leave the disk alone.  Tests guarantee the surviving
+            // session keeps its own row.
+            if let Err(e) = db.delete_session_worktree(&wt.id) {
+                log::warn!("Failed to delete shared-worktree DB row '{}': {}", wt.id, e,);
+            }
+            continue;
+        }
+
+        // Owned, non-main, non-shared — caller must run `git worktree
+        // remove` THEN `delete_session_worktree`.
+        needs_disk_removal.push(wt);
+    }
+
+    needs_disk_removal
+}
+
+/// Filesystem half of the worktree cleanup: for each owned worktree,
+/// run `git worktree remove` and delete the DB row on success.  Failures
+/// leave the row in place so they can be retried on next launch, and
+/// emit `worktree-cleanup-failed` so the UI can surface them.
+///
+/// Always runs `git worktree prune` for every distinct repo touched so
+/// stale `.git/worktrees/<ref>` entries don't accumulate even when the
+/// directory was already gone.
+fn remove_owned_worktrees_from_disk(
+    app: &AppHandle,
+    db: &Database,
+    session_id: &str,
+    worktrees: Vec<SessionWorktreeRow>,
+) {
+    let mut repos_to_prune: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for wt in worktrees {
+        let Ok(Some(proj)) = db.get_project(&wt.project_id) else {
+            // Project gone — we can't locate the parent repo to run
+            // `git worktree remove`, but we can still drop the dangling
+            // DB row so it doesn't accumulate.
+            if let Err(e) = db.delete_session_worktree(&wt.id) {
+                log::warn!("Failed to delete orphan-worktree DB row '{}': {}", wt.id, e,);
+            }
+            continue;
+        };
+
+        repos_to_prune.insert(proj.path.clone());
+
+        match crate::git::worktree::remove_worktree(&proj.path, session_id, &wt.worktree_path) {
+            Ok(()) => {
+                if let Err(e) = db.delete_session_worktree(&wt.id) {
+                    log::warn!(
+                        "Failed to delete worktree DB row '{}' after successful disk removal: {}",
+                        wt.id,
+                        e,
+                    );
+                }
+            }
+            Err(e) => {
+                log::warn!(
+                    "Failed to remove worktree '{}' for session '{}': {} — keeping DB record for retry",
+                    wt.worktree_path,
+                    session_id,
+                    e,
+                );
+                let _ = app.emit(
+                    "worktree-cleanup-failed",
+                    serde_json::json!({
+                        "sessionId": session_id,
+                        "branchName": wt.branch_name.as_deref().unwrap_or("unknown"),
+                        "error": e.to_string(),
+                    }),
+                );
+            }
+        }
+    }
+
+    for repo_path in &repos_to_prune {
+        if let Err(e) = crate::git::worktree::cleanup_stale_worktrees(repo_path) {
+            log::warn!(
+                "git worktree prune failed for '{}' during session close: {}",
+                repo_path,
+                e,
+            );
+        }
+    }
+}
+
 #[tauri::command]
 pub fn close_session(
     app: AppHandle,
@@ -2023,6 +2190,11 @@ pub fn close_session(
 ) -> Result<(), String> {
     let mut mgr = state.pty_manager.lock().unwrap_or_else(|e| e.into_inner());
 
+    // ── PTY-only cleanup (terminal sessions) ────────────────────────
+    // Pulled into its own block so we can release the PTY-manager lock
+    // before touching the DB / filesystem.  Agent sessions never insert
+    // into `mgr.sessions` — for them this branch is a no-op and the
+    // mode-agnostic cleanup below runs unconditionally.
     if let Some(mut pty_session) = mgr.sessions.remove(&session_id) {
         // Kill the child shell process FIRST — it may still be using ZDOTDIR
         // temp files. Don't block on wait() since the process may be hung.
@@ -2036,13 +2208,15 @@ pub fn close_session(
             child.wait().ok();
         });
 
-        // Save snapshot and persist token data
+        // Save snapshot and persist token data.  Note: status update +
+        // pin cleanup + worktree removal used to live in this block — for
+        // Bug 1 (1.2.x) those moved into the mode-agnostic section below
+        // so agent sessions get the same treatment.
         if let Ok(analyzer) = pty_session.analyzer.lock() {
             let snapshot = analyzer.get_stripped_output();
             let metrics = analyzer.to_metrics();
             if let Ok(db) = state.db.lock() {
                 db.save_session_snapshot(&session_id, &snapshot).ok();
-                db.update_session_status(&session_id, "destroyed").ok();
                 // Persist final token state
                 for (provider, tokens) in &metrics.token_usage {
                     db.record_token_usage(
@@ -2076,111 +2250,21 @@ pub fn close_session(
             let update = SessionUpdate::from(&*s);
             let _ = app.emit("session-updated", &update);
         }
-        let _ = app.emit("session-removed", &session_id);
+    }
 
-        // Clean up context file
-        crate::project::attunement::delete_session_context_file(&app, &session_id);
+    // ── Mode-agnostic cleanup ───────────────────────────────────────
+    // Runs for EVERY close, terminal or agent.  Without this, agent
+    // sessions leaked worktrees, DB rows, pins, the session-removed
+    // event, and the "destroyed" status — because the entire body above
+    // is unreachable when `mgr.sessions.remove(...)` returns None.
+    drop(mgr); // release PTY-manager lock before touching DB / filesystem
+    let _ = app.emit("session-removed", &session_id);
+    crate::project::attunement::delete_session_context_file(&app, &session_id);
 
-        // Clean up session-scoped pins (project-scoped pins survive)
-        if let Ok(db) = state.db.lock() {
-            let _ = db.cleanup_session_pins(&session_id);
-        }
-
-        // Clean up linked worktrees for this session.
-        // We track which worktrees were successfully removed so we only
-        // delete those DB records.  Records for failed removals are kept
-        // so they can be cleaned up on next startup.  Shared worktrees
-        // (ref count > 1) skip disk deletion to avoid breaking other sessions.
-        if let Ok(db) = state.db.lock() {
-            match db.get_session_worktrees(&session_id) {
-                Ok(worktrees) => {
-                    let mut successfully_handled: Vec<String> = Vec::new();
-                    let mut repos_to_prune: std::collections::HashSet<String> =
-                        std::collections::HashSet::new();
-
-                    for wt in &worktrees {
-                        if wt.is_main_worktree {
-                            // Main worktrees don't need disk cleanup
-                            successfully_handled.push(wt.id.clone());
-                            continue;
-                        }
-
-                        // Check if other sessions share this worktree path
-                        let ref_count = db
-                            .count_sessions_for_worktree_path(&wt.worktree_path)
-                            .unwrap_or(1);
-
-                        if ref_count > 1 {
-                            // Other sessions still use this worktree — skip disk deletion
-                            log::info!(
-                                "Worktree '{}' shared by {} sessions, skipping disk removal",
-                                wt.worktree_path,
-                                ref_count
-                            );
-                            successfully_handled.push(wt.id.clone());
-                            continue;
-                        }
-
-                        // Look up project path to run git worktree remove
-                        if let Ok(Some(proj)) = db.get_project(&wt.project_id) {
-                            repos_to_prune.insert(proj.path.clone());
-                            match crate::git::worktree::remove_worktree(
-                                &proj.path,
-                                &session_id,
-                                &wt.worktree_path,
-                            ) {
-                                Ok(()) => {
-                                    successfully_handled.push(wt.id.clone());
-                                }
-                                Err(e) => {
-                                    log::warn!(
-                                        "Failed to remove worktree '{}' for session '{}': {} — keeping DB record for retry",
-                                        wt.worktree_path,
-                                        session_id,
-                                        e
-                                    );
-                                    let _ = app.emit("worktree-cleanup-failed", serde_json::json!({
-                                        "sessionId": session_id,
-                                        "branchName": wt.branch_name.as_deref().unwrap_or("unknown"),
-                                        "error": e.to_string(),
-                                    }));
-                                }
-                            }
-                        } else {
-                            // Project not found — can't remove worktree from disk,
-                            // but we can still clean up the DB record
-                            successfully_handled.push(wt.id.clone());
-                        }
-                    }
-
-                    // Only delete DB records for successfully handled worktrees
-                    for id in &successfully_handled {
-                        if let Err(e) = db.delete_session_worktree(id) {
-                            log::warn!("Failed to delete worktree DB record '{}': {}", id, e);
-                        }
-                    }
-
-                    // Prune stale .git/worktrees/ refs for all affected repos.
-                    // This ensures refs are cleaned up even if remove_worktree
-                    // partially failed or the directory was already gone.
-                    for repo_path in &repos_to_prune {
-                        if let Err(e) = crate::git::worktree::cleanup_stale_worktrees(repo_path) {
-                            log::warn!(
-                                "git worktree prune failed for '{}' during session close: {}",
-                                repo_path,
-                                e
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    log::warn!(
-                        "Failed to get worktrees for session '{}': {}",
-                        session_id,
-                        e
-                    );
-                }
-            }
+    if let Ok(db) = state.db.lock() {
+        let needs_disk = drain_session_db_state(&db, &session_id);
+        if !needs_disk.is_empty() {
+            remove_owned_worktrees_from_disk(&app, &db, &session_id, needs_disk);
         }
     }
 
@@ -3204,4 +3288,409 @@ pub fn ssh_get_remote_git_info(
         branch,
         change_count,
     })
+}
+
+// ─── Tests ─────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::drain_session_db_state;
+    use crate::db::Database;
+    use tempfile::NamedTempFile;
+
+    fn test_db() -> Database {
+        let tmp = NamedTempFile::new().unwrap();
+        Database::new(tmp.path()).expect("Failed to create test database")
+    }
+
+    // ── Bug 1 — drain_session_db_state runs for any session id ──────
+    //
+    // Reproducer for the 1.2.x regression where closing an agent session
+    // left worktree rows + on-disk worktrees in place because the entire
+    // `close_session` cleanup body sat inside
+    // `if let Some(_) = mgr.sessions.remove(...)`, which is always None
+    // for agent sessions.  The fix extracts the DB-side cleanup into
+    // `drain_session_db_state` so it runs regardless of PTY presence.
+    //
+    // These tests cover the worktree-row branches; the session-status
+    // side effect is covered by an integration check in
+    // `close_session_invokes_drain` below.
+
+    #[test]
+    fn drain_session_db_state_returns_owned_worktrees_for_disk_removal() {
+        let db = test_db();
+        // Single owned, non-main worktree linked to an agent session.
+        db.insert_session_worktree(
+            "wt1",
+            "agent-1",
+            "proj-1",
+            "/tmp/wt-agent-1",
+            Some("feature-x"),
+            false,
+        )
+        .unwrap();
+
+        let needs_disk = drain_session_db_state(&db, "agent-1");
+
+        assert_eq!(
+            needs_disk.len(),
+            1,
+            "owned non-main worktree must be returned for git worktree remove"
+        );
+        assert_eq!(needs_disk[0].worktree_path, "/tmp/wt-agent-1");
+
+        // DB row is kept so the caller can delete it AFTER successful disk
+        // removal — failures stay in the table for retry on next startup.
+        let remaining = db.get_session_worktrees("agent-1").unwrap();
+        assert_eq!(remaining.len(), 1);
+    }
+
+    #[test]
+    fn drain_session_db_state_drops_main_worktree_row_without_disk_removal() {
+        let db = test_db();
+        db.insert_session_worktree("wt-main", "agent-1", "proj-1", "/repo", Some("main"), true)
+            .unwrap();
+
+        let needs_disk = drain_session_db_state(&db, "agent-1");
+
+        assert!(
+            needs_disk.is_empty(),
+            "main worktree is never removed from disk by close"
+        );
+        let rows = db.get_session_worktrees("agent-1").unwrap();
+        assert!(rows.is_empty(), "main worktree DB row should be dropped");
+    }
+
+    #[test]
+    fn drain_session_db_state_drops_shared_worktree_row_without_disk_removal() {
+        let db = test_db();
+        // Two sessions reference the same worktree_path → ref_count = 2.
+        db.insert_session_worktree(
+            "wt-shared-a",
+            "agent-1",
+            "proj-1",
+            "/tmp/wt-shared",
+            Some("feature-x"),
+            false,
+        )
+        .unwrap();
+        db.insert_session_worktree(
+            "wt-shared-b",
+            "agent-2",
+            "proj-1",
+            "/tmp/wt-shared",
+            Some("feature-x"),
+            false,
+        )
+        .unwrap();
+
+        let needs_disk = drain_session_db_state(&db, "agent-1");
+
+        assert!(
+            needs_disk.is_empty(),
+            "shared worktree must not be removed while another session uses it"
+        );
+        // Our row is gone; the other session's row survives.
+        let ours = db.get_session_worktrees("agent-1").unwrap();
+        let theirs = db.get_session_worktrees("agent-2").unwrap();
+        assert!(ours.is_empty());
+        assert_eq!(theirs.len(), 1);
+    }
+
+    #[test]
+    fn drain_session_db_state_handles_missing_session() {
+        // The agent close path may call drain for a session id that has
+        // no worktree rows AND no sessions row (e.g. close called twice).
+        // It must be safe to invoke — no panic, no error, just a no-op.
+        let db = test_db();
+        let needs_disk = drain_session_db_state(&db, "ghost-session");
+        assert!(needs_disk.is_empty());
+    }
+
+    // ── Regression suite for the close path (Bug 1) ─────────────────
+    //
+    // The user explicitly asked that the terminal-mode path NOT regress
+    // when the close cleanup was extracted into helpers.  These tests
+    // exercise scenarios that the OLD pre-refactor code handled, so any
+    // regression in `drain_session_db_state` (or the new close flow that
+    // calls it) trips one of these.
+
+    use rusqlite::params;
+
+    /// Insert a minimal `sessions` row so we can verify `phase` transitions.
+    /// Bypasses the typed API to stay independent of unrelated columns.
+    fn insert_minimal_session(db: &Database, id: &str, mode: &str) {
+        db.conn
+            .execute(
+                "INSERT INTO sessions (id, label, description, color, group_name, phase, working_directory, shell, workspace_paths, created_at, ssh_info)
+                 VALUES (?1, ?2, '', '#000', NULL, 'idle', '/tmp', '/bin/sh', '[]', '2026-05-13', NULL)",
+                params![id, format!("S-{}-{}", mode, id)],
+            )
+            .unwrap();
+    }
+
+    fn phase_of(db: &Database, id: &str) -> Option<String> {
+        db.conn
+            .query_row(
+                "SELECT phase FROM sessions WHERE id = ?1",
+                params![id],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+    }
+
+    #[test]
+    fn drain_sets_phase_destroyed_for_terminal_session() {
+        // Terminal sessions had their phase flipped to "destroyed" via the
+        // PTY-block's `update_session_status` call before this refactor.
+        // The same transition must happen now via drain_session_db_state.
+        let db = test_db();
+        insert_minimal_session(&db, "term-1", "terminal");
+        assert_eq!(phase_of(&db, "term-1").as_deref(), Some("idle"));
+
+        drain_session_db_state(&db, "term-1");
+
+        assert_eq!(
+            phase_of(&db, "term-1").as_deref(),
+            Some("destroyed"),
+            "terminal session phase must still flip to 'destroyed' after the close refactor",
+        );
+    }
+
+    #[test]
+    fn drain_sets_phase_destroyed_for_agent_session_regression() {
+        // The 1.2.x bug: agent sessions never had `update_session_status`
+        // called on close.  The fix is that drain runs unconditionally.
+        let db = test_db();
+        insert_minimal_session(&db, "agent-1", "agent");
+        drain_session_db_state(&db, "agent-1");
+        assert_eq!(
+            phase_of(&db, "agent-1").as_deref(),
+            Some("destroyed"),
+            "agent close must flip phase to 'destroyed' (Bug 1 regression)",
+        );
+    }
+
+    #[test]
+    fn drain_handles_mixed_worktree_set_for_one_session() {
+        // A session with a main worktree on project A AND an owned
+        // non-main worktree on project B.  Drain must:
+        //   - drop the main row immediately,
+        //   - return the owned row for disk removal,
+        //   - leave the owned row in the DB until the caller deletes it.
+        //
+        // Two different projects because session_worktrees has
+        // UNIQUE(session_id, realm_id) — multi-project attachment is the
+        // realistic scenario for a single session having both kinds of
+        // worktree rows.
+        let db = test_db();
+        insert_minimal_session(&db, "term-mix", "terminal");
+        db.insert_session_worktree("wt-main", "term-mix", "proj-A", "/repo-a", None, true)
+            .unwrap();
+        db.insert_session_worktree(
+            "wt-feat",
+            "term-mix",
+            "proj-B",
+            "/tmp/wt-feat",
+            Some("feature-y"),
+            false,
+        )
+        .unwrap();
+
+        let needs_disk = drain_session_db_state(&db, "term-mix");
+
+        assert_eq!(
+            needs_disk.len(),
+            1,
+            "only the owned non-main worktree needs disk removal"
+        );
+        assert_eq!(needs_disk[0].id, "wt-feat");
+        // Main row was dropped; owned row is kept for the caller.
+        let remaining: Vec<String> = db
+            .get_session_worktrees("term-mix")
+            .unwrap()
+            .into_iter()
+            .map(|w| w.id)
+            .collect();
+        assert_eq!(remaining, vec!["wt-feat".to_string()]);
+        assert_eq!(phase_of(&db, "term-mix").as_deref(), Some("destroyed"));
+    }
+
+    #[test]
+    fn drain_is_idempotent_for_session_with_owned_worktree() {
+        // Calling drain twice (e.g. on retry) must be safe: the second
+        // call sees an unchanged DB and returns the same owned worktree
+        // for retry.  No panic, no duplicate side effects.
+        let db = test_db();
+        insert_minimal_session(&db, "agent-retry", "agent");
+        db.insert_session_worktree(
+            "wt-retry",
+            "agent-retry",
+            "proj-1",
+            "/tmp/wt-retry",
+            Some("feature-z"),
+            false,
+        )
+        .unwrap();
+
+        let first = drain_session_db_state(&db, "agent-retry");
+        let second = drain_session_db_state(&db, "agent-retry");
+
+        assert_eq!(first.len(), 1);
+        assert_eq!(
+            second.len(),
+            1,
+            "second drain must see the same row (caller didn't delete after failure)"
+        );
+        assert_eq!(first[0].id, "wt-retry");
+        assert_eq!(second[0].id, "wt-retry");
+        assert_eq!(phase_of(&db, "agent-retry").as_deref(), Some("destroyed"));
+    }
+
+    #[test]
+    fn drain_does_not_affect_other_live_sessions() {
+        // Two unrelated sessions in the DB.  Closing one must NOT touch
+        // the other's row, worktrees, or phase.  Important when the user
+        // has many sessions open and closes one.
+        let db = test_db();
+        insert_minimal_session(&db, "closing", "agent");
+        insert_minimal_session(&db, "surviving", "terminal");
+        db.insert_session_worktree(
+            "wt-c",
+            "closing",
+            "proj-1",
+            "/tmp/wt-c",
+            Some("feat-c"),
+            false,
+        )
+        .unwrap();
+        db.insert_session_worktree(
+            "wt-s",
+            "surviving",
+            "proj-1",
+            "/tmp/wt-s",
+            Some("feat-s"),
+            false,
+        )
+        .unwrap();
+
+        drain_session_db_state(&db, "closing");
+
+        assert_eq!(
+            phase_of(&db, "surviving").as_deref(),
+            Some("idle"),
+            "the other session must not be touched"
+        );
+        let surviving_wts = db.get_session_worktrees("surviving").unwrap();
+        assert_eq!(surviving_wts.len(), 1);
+        assert_eq!(surviving_wts[0].id, "wt-s");
+    }
+
+    #[test]
+    fn drain_clears_session_pins_for_terminal_session() {
+        // Session-scoped pins must be cleared on close for both modes.
+        // Project-scoped pins (session_id IS NULL) must survive — they
+        // belong to the project, not the session that pinned them.
+        let db = test_db();
+        insert_minimal_session(&db, "term-pin", "terminal");
+        db.conn
+            .execute(
+                "INSERT INTO context_pins (session_id, project_id, kind, target, label)
+                 VALUES ('term-pin', 'proj-1', 'file', '/repo/a', 'A')",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO context_pins (session_id, project_id, kind, target, label)
+                 VALUES (NULL, 'proj-1', 'file', '/repo/b', 'B')",
+                [],
+            )
+            .unwrap();
+
+        drain_session_db_state(&db, "term-pin");
+
+        let surviving_labels: Vec<String> = db
+            .conn
+            .prepare("SELECT label FROM context_pins ORDER BY label")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            surviving_labels,
+            vec!["B".to_string()],
+            "project-scoped pin must survive; session-scoped pin must be cleaned",
+        );
+    }
+
+    #[test]
+    fn drain_clears_session_pins_for_agent_session_regression() {
+        // The mirror of the above for agent mode — proves the Bug 1 fix
+        // also restores pin cleanup, which used to live inside the
+        // unreachable `if let Some(pty_session)` block.
+        let db = test_db();
+        insert_minimal_session(&db, "agent-pin", "agent");
+        db.conn
+            .execute(
+                "INSERT INTO context_pins (session_id, project_id, kind, target, label)
+                 VALUES ('agent-pin', 'proj-1', 'file', '/repo/a', 'A')",
+                [],
+            )
+            .unwrap();
+
+        drain_session_db_state(&db, "agent-pin");
+
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM context_pins", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "agent-session pin must be cleaned (Bug 1 regression)"
+        );
+    }
+
+    // ── #317 — terminal-mode model changes must reach the UI ────────
+
+    fn agent(model: Option<&str>) -> Option<crate::pty::models::AgentInfo> {
+        Some(crate::pty::models::AgentInfo {
+            name: "Claude Code".into(),
+            provider: "anthropic".into(),
+            model: model.map(Into::into),
+            detected_at: String::new(),
+            confidence: 1.0,
+        })
+    }
+
+    #[test]
+    fn agent_model_emit_on_first_detection_and_enrichment() {
+        assert!(super::agent_model_needs_emit(&None, &agent(None)));
+        assert!(super::agent_model_needs_emit(
+            &agent(None),
+            &agent(Some("opus"))
+        ));
+    }
+
+    #[test]
+    fn agent_model_emit_on_some_to_some_change() {
+        assert!(super::agent_model_needs_emit(
+            &agent(Some("sonnet")),
+            &agent(Some("opus"))
+        ));
+    }
+
+    #[test]
+    fn agent_model_no_emit_when_unchanged_or_lost() {
+        assert!(!super::agent_model_needs_emit(
+            &agent(Some("opus")),
+            &agent(Some("opus"))
+        ));
+        assert!(!super::agent_model_needs_emit(
+            &agent(Some("opus")),
+            &agent(None)
+        ));
+        assert!(!super::agent_model_needs_emit(&agent(None), &None));
+    }
 }

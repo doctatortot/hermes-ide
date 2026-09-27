@@ -1186,7 +1186,16 @@ async fn e2e_add_dir_grants_extra_project_access() {
     std::fs::write(&sentinel_path, "the secret password is rheostat\n").expect("write sentinel");
 
     let sid = uuid::Uuid::new_v4().to_string();
-    let plan = build_spawn_args(&sid, &cwd, None, None, None, None, &[extra.clone()], false);
+    let plan = build_spawn_args(
+        &sid,
+        &cwd,
+        None,
+        None,
+        None,
+        None,
+        std::slice::from_ref(&extra),
+        false,
+    );
 
     // Quick sanity: argv should carry --add-dir <extra>.
     let argv = plan.args.join(" ");
@@ -1297,11 +1306,10 @@ async fn e2e_hermes_mcp_reads_ide_state() {
     let stdout = child.stdout.take().expect("stdout");
     let stderr_pipe = child.stderr.take().expect("stderr");
 
-    let prompt = format!(
-        "Use the `mcp__hermes__get_project_state` tool right now to fetch the IDE state, \
+    let prompt = "Use the `mcp__hermes__get_project_state` tool right now to fetch the IDE state, \
          then reply with ONLY the value of the `activeFile` field from the result. \
          Reply with just that single string, no other words."
-    );
+        .to_string();
     let envelope = serde_json::json!({
         "type": "user",
         "message": { "role": "user", "content": [{ "type": "text", "text": prompt }] }
@@ -1643,7 +1651,16 @@ async fn e2e_attach_then_resume_grants_access() {
     // Turn 1 — initial spawn with only A in --add-dir.  Establishes a
     // resumable session so turn 2 can come back via --resume.
     let sid1 = uuid::Uuid::new_v4().to_string();
-    let plan1 = build_spawn_args(&sid1, &cwd, None, None, None, None, &[dir_a.clone()], false);
+    let plan1 = build_spawn_args(
+        &sid1,
+        &cwd,
+        None,
+        None,
+        None,
+        None,
+        std::slice::from_ref(&dir_a),
+        false,
+    );
     let t1 = run_one_turn(&plan1.args, &plan1.working_dir, "Reply 'ok'.")
         .await
         .expect("attach turn 1");
@@ -1749,7 +1766,7 @@ async fn e2e_detach_then_resume_revokes_access() {
         None,
         None,
         None,
-        &[dir_a.clone()],
+        std::slice::from_ref(&dir_a),
         false,
     );
     assert_eq!(

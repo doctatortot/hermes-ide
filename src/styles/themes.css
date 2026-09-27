@@ -185,7 +185,8 @@ html[data-theme="frosted-dark"] .activity-bar-tab.active {
 }
 
 html[data-theme="frosted-dark"] .context-menu,
-html[data-theme="frosted-dark"] .status-theme-popover {
+html[data-theme="frosted-dark"] .status-theme-popover,
+html[data-theme="frosted-dark"] .agent-subagent-popover {
   background: rgba(44, 44, 46, 0.82);
   backdrop-filter: blur(20px) saturate(180%);
   -webkit-backdrop-filter: blur(20px) saturate(180%);
@@ -601,7 +602,8 @@ html[data-theme="frosted-light"] .activity-bar-tab.active {
 }
 
 html[data-theme="frosted-light"] .context-menu,
-html[data-theme="frosted-light"] .status-theme-popover {
+html[data-theme="frosted-light"] .status-theme-popover,
+html[data-theme="frosted-light"] .agent-subagent-popover {
   background: rgba(255, 255, 255, 0.85);
   backdrop-filter: blur(20px) saturate(180%);
   -webkit-backdrop-filter: blur(20px) saturate(180%);

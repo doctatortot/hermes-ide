@@ -767,7 +767,7 @@ mod prewarm_tests {
     }
 
     #[test]
-    fn mcp_spec_NEVER_returns_env_values() {
+    fn mcp_spec_never_returns_env_values() {
         // Strict redaction contract — env values may carry tokens.
         let _g = HOME_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let td = tempdir().unwrap();

@@ -137,3 +137,118 @@
   font-family: var(--font-mono);
   flex: 0 0 auto;
 }
+
+/* ── Staleness indicator + per-row mark-done (added 2026-05-12) ────── */
+
+/* Header pip when the agent hasn't refreshed the list for N turns. */
+/* Stale pip — quiet brass, not a yellow shout.  Posture from the
+ * design system: "chrome whispers, state shouts."  A stale-but-not-
+ * broken todo list is a whisper; the operator should notice on a
+ * scan but not flinch.  Word "stale" is mono uppercase like other
+ * kicker labels; the elaboration "5 turns ago" sits in italic serif
+ * — editorial register — to read as a quiet aside, not a warning. */
+.todo-panel-stale {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  letter-spacing: 0;
+  font-weight: 500;
+}
+.todo-panel-stale-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--brass, var(--accent));
+  opacity: 0.55;
+  animation: todo-glyph-breathe 2.2s ease-in-out infinite;
+  align-self: center;
+}
+.todo-panel-stale-word {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  font-weight: 600;
+  color: var(--brass-bright, var(--accent));
+  opacity: 0.85;
+}
+.todo-panel-stale-detail {
+  font-family: var(--font-serif, var(--font-mono));
+  font-style: italic;
+  font-size: 11px;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--ink-tertiary, var(--text-3));
+  font-weight: 400;
+}
+
+/* When the whole panel is stale, dim the in-progress row's glow so it
+ * stops competing for attention — its claim of "in progress" is suspect
+ * and the pip in the header is the load-bearing cue now. */
+.todo-panel[data-stale="true"] .todo-row[data-status="in_progress"] .todo-glyph {
+  animation: none;
+  opacity: 0.55;
+}
+
+/* The in-progress glyph is now `❯` (active mark, distinct from the
+ * disclosure `▸`).  Give it a slight brass weight and gentle pulse so
+ * it carries the "this is the one Claude is working on" signal without
+ * competing with the row's surrounding affordances. */
+.todo-row[data-status="in_progress"] .todo-glyph {
+  font-weight: var(--weight-bold, 700);
+  font-size: 13px;
+  line-height: 1;
+  transform: translateY(-0.5px);
+}
+
+/* Per-row action button (✓ to mark done locally, ↺ to undo).  Hidden
+ * until the row is hovered or focused — keeps the panel clean on
+ * sessions where the user never interacts with it. */
+.todo-row-action {
+  appearance: none;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--ink-tertiary, var(--text-3));
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1;
+  padding: 2px 6px;
+  border-radius: 3px;
+  cursor: pointer;
+  opacity: 0;
+  transition:
+    opacity 120ms ease,
+    color 120ms ease,
+    border-color 120ms ease,
+    background 120ms ease;
+  flex: 0 0 auto;
+}
+.todo-row:hover .todo-row-action,
+.todo-row:focus-within .todo-row-action,
+.todo-row[data-local-done="true"] .todo-row-action {
+  opacity: 1;
+}
+.todo-row-action:hover {
+  color: var(--green, var(--brass));
+  border-color: var(--green, var(--brass));
+  background: var(--bg-2, transparent);
+}
+.todo-row[data-local-done="true"] .todo-row-action {
+  color: var(--brass, var(--accent));
+  border-color: var(--brass, var(--accent));
+}
+
+/* When a row has been locally marked done but the agent's status
+ * disagrees, render the row in the done style (line-through) but
+ * keep a faint brass tint on the glyph so the user can tell the
+ * "done" state is from them, not the agent. */
+.todo-row[data-local-done="true"] .todo-content {
+  color: var(--ink-tertiary, var(--text-3));
+  text-decoration: line-through;
+  text-decoration-thickness: 1px;
+  text-decoration-color: var(--brass, var(--accent));
+}
+.todo-row[data-local-done="true"] .todo-glyph {
+  color: var(--brass, var(--accent));
+  opacity: 0.75;
+}

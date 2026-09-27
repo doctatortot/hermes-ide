@@ -67,7 +67,9 @@ pub struct ProjectCostEntry {
 }
 
 pub struct Database {
-    conn: Connection,
+    // `pub(crate)` so close_session integration tests in pty/commands.rs
+    // can insert minimal session rows without a full SessionUpdate.
+    pub(crate) conn: Connection,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2460,6 +2462,8 @@ const VALID_SETTING_KEYS: &[&str] = &[
     "ssh_connection_history",
     // UI layout
     "activity_bar_order",
+    // Localization
+    "ui_language",
 ];
 
 #[tauri::command]
