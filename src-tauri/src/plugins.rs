@@ -398,6 +398,12 @@ pub async fn plugin_post_json(
 #[derive(Debug, Serialize)]
 pub struct PluginHttpResponse {
     pub status: u16,
+    /// Response headers as a flat map: an explicit choice, not an oversight.
+    /// Repeated headers (e.g. multiple `Set-Cookie`) collapse to whichever
+    /// value iterates last, and a header value that isn't valid UTF-8/ASCII
+    /// comes back as `""` (see `.to_str().unwrap_or("")` below) rather than
+    /// erroring the whole request. Fine for the plugins this exists for
+    /// today; revisit with a multi-map if a plugin ever needs every value.
     pub headers: std::collections::HashMap<String, String>,
     pub body: String,
 }
