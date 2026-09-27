@@ -6,6 +6,7 @@
 //! rationale and `wondrous-wishing-quilt` plan for the phase-by-phase build.
 
 mod prewarm;
+mod runtime;
 pub use prewarm::prewarm_bridge_runtime;
 
 use std::collections::HashMap;
@@ -219,6 +220,35 @@ fn resolve_bridge_path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
             .collect::<Vec<_>>()
             .join(", ")
     ))
+}
+
+/// Resolve where the bridge's npm deps (the Claude Agent SDK + zod) should
+/// be loaded from, when that isn't simply "next to `bridge_path`".
+///
+/// Dev builds keep `node_modules` staged directly next to
+/// `hermes-claude-bridge.mjs` (via `scripts/stage-bridge-deps.mjs`) — Node's
+/// own resolution already finds it there, so this returns `Ok(None)` and
+/// the bridge's imports stay plain bare specifiers, completely unchanged
+/// from before ADR 002 (see docs/adr/002-bridge-runtime-tarball.md).
+///
+/// Production builds ship the SDK as a compressed `bridge-runtime.tar.zst`
+/// resource instead — `bridge_path`'s own directory has no `node_modules`
+/// at all. This extracts it (once per SDK version, cached across calls —
+/// see [`runtime::runtime_dir`]) and returns `Ok(Some(dir))`; the caller
+/// passes `dir` to the bridge via `--bridge-runtime-dir`, and the bridge
+/// reads `dir/manifest.json` to resolve each npm dep's exact entry file
+/// (recorded at build time by `scripts/pack-bridge-runtime.mjs`, since a
+/// package's `exports` map can change shape across SDK versions).
+async fn resolve_bridge_runtime_dir(
+    app: &AppHandle,
+    bridge_path: &std::path::Path,
+) -> Result<Option<std::path::PathBuf>, String> {
+    if let Some(dir) = bridge_path.parent() {
+        if dir.join("node_modules").is_dir() {
+            return Ok(None);
+        }
+    }
+    runtime::runtime_dir(app).await.map(|rd| Some(rd.dir))
 }
 
 // ─── Node resolution ──────────────────────────────────────────────
@@ -541,6 +571,17 @@ pub async fn spawn_agent_session(
                 .to_string()
         })?)
     };
+    // Where the bridge's npm deps (SDK + zod) live, if not simply next to
+    // `bridge_path` — see `resolve_bridge_runtime_dir` and ADR 002. `None`
+    // in dev (adjacent `node_modules`, unchanged bare-specifier imports);
+    // `Some(dir)` in production, where extraction from the bundled tarball
+    // happens here (idempotent, cached — see `runtime::runtime_dir`).
+    let runtime_dir = if use_direct {
+        None
+    } else {
+        resolve_bridge_runtime_dir(&app, &bridge_path).await?
+    };
+    let runtime_dir_str = runtime_dir.as_ref().map(|d| d.to_string_lossy().into_owned());
 
     log::info!(
         "[agent spawn] sid={} cwd={} bridge={} node={:?} use_direct={} argv={:?}",
@@ -588,6 +629,9 @@ pub async fn spawn_agent_session(
         c.args(["--working-dir", &plan.working_dir]);
         if !state_path.is_empty() {
             c.args(["--hermes-state-path", &state_path]);
+        }
+        if let Some(dir) = &runtime_dir_str {
+            c.args(["--bridge-runtime-dir", dir]);
         }
         c.args(&plan.args);
         c

@@ -21,7 +21,7 @@ use std::time::Duration;
 use tauri::AppHandle;
 use tokio::process::Command;
 
-use super::{resolve_bridge_path, which_node};
+use super::{resolve_bridge_path, resolve_bridge_runtime_dir, which_node};
 
 /// Spawn a non-blocking, best-effort prewarm of the bridge runtime.
 ///
@@ -45,6 +45,20 @@ pub fn prewarm_bridge_runtime(app: &AppHandle) {
                 return;
             }
         };
+        // Production builds ship the SDK as a compressed tarball resource
+        // (ADR 002) instead of a `node_modules` adjacent to the bridge, so
+        // this is also where the runtime gets extracted — the whole point
+        // of running it here, just before the warm-up import below, is
+        // that most users never see the extraction latency: it overlaps
+        // with them picking a project, not their first Agent session.
+        let import_cwd = match resolve_bridge_runtime_dir(&app, &bridge_path).await {
+            Ok(Some(dir)) => dir,
+            Ok(None) => bridge_dir.clone(),
+            Err(e) => {
+                log::debug!("[prewarm] skipping — bridge runtime not extractable: {}", e);
+                return;
+            }
+        };
         let node = match which_node() {
             Some(n) => n,
             None => {
@@ -60,7 +74,7 @@ pub fn prewarm_bridge_runtime(app: &AppHandle) {
         cmd.arg("--input-type=module")
             .arg("--eval")
             .arg("import('@anthropic-ai/claude-agent-sdk').catch(()=>{});")
-            .current_dir(&bridge_dir)
+            .current_dir(&import_cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
