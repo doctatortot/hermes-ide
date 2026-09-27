@@ -16,7 +16,7 @@
     "lint:tsc": "tsc --noEmit",
     "lint": "eslint .",
     "postinstall": "patch-package && node scripts/stage-bridge-deps.mjs",
-    "prepare:bridge": "node scripts/stage-bridge-deps.mjs",
+    "prepare:bridge": "node scripts/stage-bridge-deps.mjs && node scripts/pack-bridge-runtime.mjs",
     "bump": "node scripts/bump-version.mjs",
     "changelog": "bash scripts/generate-changelog.sh",
     "changelog:update": "UPDATE_CHANGELOG=true bash scripts/generate-changelog.sh"

@@ -1,6 +1,7 @@
 # Dependencies
 node_modules/
 src-tauri/bridge/node_modules/
+src-tauri/bridge/runtime/
 
 # Build outputs
 dist/
