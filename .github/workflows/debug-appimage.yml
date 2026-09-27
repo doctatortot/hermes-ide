@@ -66,7 +66,15 @@ jobs:
         uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
         with:
           packages: libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libfuse2 file desktop-file-utils
-          version: 1.0
+          # Cache key bumped from 1.0 -> 1.2: the version-1.0 cache appears to
+          # have been poisoned with an empty package set (this action reports
+          # success and silently caches "0 installed packages" when apt-get
+          # can't fetch every archive in one transaction — confirmed on
+          # scratch/adr002-appimage-verify, where a version:1.1 cache-bust
+          # attempt hit a transient apt-mirror 404 on unrelated GStreamer
+          # packages and reproduced the exact same silent 0-package cache).
+          # 1.2 is a fresh key neither attempt has touched.
+          version: 1.2
 
       - name: Install npm deps + stage bridge runtime
         run: npm ci
