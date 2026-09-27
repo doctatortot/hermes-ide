@@ -84,10 +84,16 @@ jobs:
 
       - name: Build AppImage with maximum verbosity
         run: |
-          set -x
+          set -x -o pipefail
           # The verbose flag on tauri-cli reveals which subcommands are
           # being invoked.  Combined with RUST_LOG=trace, we should see
           # linuxdeploy's argv and any stderr it produces.
+          #
+          # pipefail matters here: without it, this step's exit code is
+          # `tee`'s (always 0), so a real `tauri build` failure (e.g. a
+          # tauri/@tauri-apps version mismatch aborting before the bundler
+          # even runs) is invisible to `steps.*.outcome` even though
+          # continue-on-error already keeps the job itself green.
           TARGET="${{ inputs.arch == 'aarch64' && 'aarch64-unknown-linux-gnu' || 'x86_64-unknown-linux-gnu' }}"
           npx tauri build --target "$TARGET" --bundles appimage --verbose 2>&1 | tee /tmp/appimage-build.log
         continue-on-error: true
@@ -106,7 +112,8 @@ jobs:
           find src-tauri/target -path "*appimage*" -type d 2>/dev/null
           echo
           echo "=== AppDir tail of any run log ==="
-          find src-tauri/target -path "*appimage*" -name "*.log" -exec echo "----- {} -----" \; -exec cat {} \; 2>/dev/null
+          find src-tauri/target -path "*appimage*" -name "*.log" -exec echo "----- {} -----" \; -exec cat {} \;
+          true
 
       - name: Upload diagnostic artifacts
         if: always()
