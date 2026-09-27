@@ -40,3 +40,12 @@ release-artifacts/
 scripts/release-local.env
 .hermes/
 .claude/
+
+# Personal marketing assets — promo videos, design mockups, etc.
+# Belong on the maintainer's machine, not in the repo.
+marketing/
+docs/design/preview/
+
+# Local tooling state (Playwright-MCP traces, Claude superpowers cache).
+.playwright-mcp/
+.superpowers/

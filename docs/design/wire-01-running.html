@@ -1,0 +1,53 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Wire — tool running</title>
+<style>
+  :root{
+    --bg-0:#1a1c20;--bg-1:#20232a;--text-1:#d6d6d9;--text-2:#8e8e93;--text-3:#5c5c61;
+    --brass:#ffb340;--brass-dim:rgba(255,179,64,.18);--rule:#2d2d2f;
+    --font-ui:"Inter Tight",system-ui,sans-serif;
+    --font-serif:"Newsreader","Lyon Text",Georgia,serif;
+    --font-code:"JetBrains Mono",ui-monospace,Menlo,monospace;
+    --text-2xs:10px;--text-xs:11px;--text-base:13px;
+    --space-3:12px;--dur-quick:140ms;--dur-base:220ms;
+    --ease-out-soft:cubic-bezier(.22,.61,.36,1);
+  }
+  html,body{margin:0;background:var(--bg-0);color:var(--text-1);font-family:var(--font-ui);}
+  .frame{max-width:780px;margin:48px auto;border:1px solid var(--rule);background:var(--bg-1);}
+  .body{padding:24px;color:var(--text-2);font-size:13px;line-height:1.6;font-family:var(--font-serif);}
+  .body p{margin:0 0 12px}
+
+  .wire{
+    display:grid;grid-template-columns:max-content 1fr max-content;
+    align-items:baseline;gap:var(--space-3);height:28px;padding:0 var(--space-3);
+    border-top:1px solid var(--rule);border-bottom:1px solid var(--brass-dim);
+    background:linear-gradient(to bottom,transparent,rgba(255,179,64,.03));
+    font-feature-settings:"tnum","zero";
+  }
+  .wire__kicker{font-family:var(--font-code);font-size:var(--text-2xs);
+    letter-spacing:.08em;text-transform:uppercase;color:var(--text-2);}
+  .wire__caption{font-family:var(--font-serif);font-style:italic;font-size:var(--text-base);
+    line-height:1.2;color:var(--text-1);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+    animation:wire-in var(--dur-quick) var(--ease-out-soft);}
+  .wire__caption .spark{
+    display:inline-block;width:.6ch;height:1.5px;margin-left:2px;vertical-align:baseline;
+    background:var(--brass);box-shadow:0 0 6px 0 var(--brass-dim);
+    animation:wire-breathe 1050ms var(--ease-out-soft) infinite alternate;
+  }
+  .wire__chrono{font-family:var(--font-code);font-size:var(--text-xs);color:var(--text-3);
+    font-variant-numeric:tabular-nums;}
+  @keyframes wire-in{from{opacity:0;transform:translateY(2px)}to{opacity:1;transform:none}}
+  @keyframes wire-breathe{from{opacity:.55}to{opacity:1}}
+  @media (prefers-reduced-motion:reduce){.wire *{animation:none!important}}
+</style></head>
+<body>
+  <div class="frame">
+    <div class="body">
+      <p>I'll run the test suite now and report back what's failing.</p>
+      <p style="color:var(--text-3)">&nbsp;</p>
+    </div>
+    <div class="wire">
+      <span class="wire__kicker">Running</span>
+      <span class="wire__caption">Bash — <code style="font-family:var(--font-code);font-style:normal;font-size:12px;color:var(--text-1)">pnpm test --filter=agent</code><span class="spark"></span></span>
+      <span class="wire__chrono">0:03</span>
+    </div>
+  </div>
+</body></html>

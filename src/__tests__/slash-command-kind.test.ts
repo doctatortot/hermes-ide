@@ -16,8 +16,10 @@
  */
 import { describe, it, expect } from "vitest";
 import {
+  buildSlashItemsFromInit,
   classifySlashCommand,
   missingCliBuiltins,
+  resolveSlashCommandKind,
   stripSlash,
 } from "../utils/slashCommandKind";
 
@@ -257,5 +259,160 @@ describe("stripSlash", () => {
   });
   it("only strips ONE leading slash (defensive)", () => {
     expect(stripSlash("//mcp")).toBe("/mcp");
+  });
+});
+
+/* ─── Regression: `/compact` and other SDK-reported natives ─────────
+ *
+ * Real bug reported by a user in 1.3.0: after the agent session hit
+ * "prompt is too long", typing `/compact` showed the embedded-terminal
+ * banner instead of sending the command through stream-json.  Root
+ * cause: `init.slash_commands` enumerates commands available natively
+ * over stream-json, but the SDK reports them as bare strings (no
+ * description).  When the SessionComposer built items from init, it
+ * left `kind` unset, then re-ran the classifier — which saw an empty
+ * description, fell through to KNOWN_CLI_COMMANDS, and stamped
+ * `kind: "cli"` on the very commands the SDK said were native.
+ *
+ * The fix introduces a dedicated builder (`buildSlashItemsFromInit`)
+ * that pins SDK-reported entries to `kind: "native"` BEFORE any
+ * classifier-based fallback runs, plus a `resolveSlashCommandKind`
+ * helper for the submit-time path (user types `/compact<Enter>`
+ * without picking from the dropdown).
+ *
+ * These tests pin both halves of the contract. */
+describe("buildSlashItemsFromInit — SDK init.slash_commands routing", () => {
+  it("bare-string SDK entries are kind:'native' (NOT classified by KNOWN_CLI_COMMANDS)", () => {
+    // The four bare strings the SDK actually emits as of v2.1.x.
+    // `compact`/`clear`/`init`/`review` are all in KNOWN_CLI_COMMANDS,
+    // which would mis-classify them to "cli" if we ran the classifier.
+    const items = buildSlashItemsFromInit(["clear", "compact", "init", "review"]);
+    const sdkEntries = items.filter((i) =>
+      ["/clear", "/compact", "/init", "/review"].includes(i.command),
+    );
+    expect(sdkEntries).toHaveLength(4);
+    for (const item of sdkEntries) {
+      expect(
+        item.kind,
+        `${item.command} must be native — SDK enumerated it in init.slash_commands`,
+      ).toBe("native");
+    }
+  });
+
+  it("normalizes a missing leading slash", () => {
+    const items = buildSlashItemsFromInit(["compact"]);
+    const compact = items.find((i) => i.command === "/compact");
+    expect(compact).toBeDefined();
+  });
+
+  it("preserves an existing leading slash", () => {
+    const items = buildSlashItemsFromInit(["/compact"]);
+    const compact = items.find((i) => i.command === "/compact");
+    expect(compact).toBeDefined();
+    expect(items.filter((i) => i.command === "//compact")).toHaveLength(0);
+  });
+
+  it("object-form SDK entries preserve description and are native", () => {
+    const items = buildSlashItemsFromInit([
+      { command: "/compact", description: "Summarize conversation history" },
+      { command: "review", description: "Review the diff" },
+    ]);
+    const compact = items.find((i) => i.command === "/compact")!;
+    expect(compact.kind).toBe("native");
+    expect(compact.description).toBe("Summarize conversation history");
+    const review = items.find((i) => i.command === "/review")!;
+    expect(review.kind).toBe("native");
+  });
+
+  it("still appends curated CLI builtins missing from the SDK list as kind:'cli'", () => {
+    const items = buildSlashItemsFromInit(["compact"]);
+    const byCmd = new Map(items.map((i) => [i.command, i]));
+    expect(byCmd.get("/compact")?.kind).toBe("native");
+    // The curated catalog is still merged in — these commands aren't
+    // in the SDK's stream-json list and DO need an embedded terminal.
+    expect(byCmd.get("/mcp")?.kind).toBe("cli");
+    expect(byCmd.get("/agents")?.kind).toBe("cli");
+    expect(byCmd.get("/login")?.kind).toBe("cli");
+  });
+
+  it("does NOT duplicate when SDK reports a name also in the curated CLI catalog", () => {
+    // `/help` is in KNOWN_CLI_COMMANDS, but if the SDK reports it, the
+    // SDK wins — and we must NOT also append a cli-kind duplicate.
+    const items = buildSlashItemsFromInit(["help"]);
+    const helpEntries = items.filter((i) => i.command === "/help");
+    expect(helpEntries).toHaveLength(1);
+    expect(helpEntries[0].kind).toBe("native");
+  });
+
+  it("falls back to prewarm string list when init.slash_commands is missing", () => {
+    const items = buildSlashItemsFromInit(undefined, ["custom-skill"]);
+    const custom = items.find((i) => i.command === "/custom-skill");
+    expect(custom).toBeDefined();
+    // Prewarm-sourced commands run through the classifier — unknown
+    // verbs default to native.  Curated CLI builtins (`/mcp`, …) are
+    // still appended.
+    expect(custom?.kind).toBe("native");
+    const mcp = items.find((i) => i.command === "/mcp");
+    expect(mcp?.kind).toBe("cli");
+  });
+
+  it("empty init.slash_commands STILL appends curated CLI builtins", () => {
+    const items = buildSlashItemsFromInit([]);
+    expect(items.some((i) => i.command === "/mcp" && i.kind === "cli")).toBe(true);
+    expect(items.some((i) => i.command === "/login" && i.kind === "cli")).toBe(true);
+  });
+
+  it("never returns an item with undefined kind", () => {
+    const items = buildSlashItemsFromInit(["compact", "clear"], ["custom"]);
+    for (const item of items) {
+      expect(item.kind === "native" || item.kind === "cli").toBe(true);
+    }
+  });
+});
+
+describe("resolveSlashCommandKind — submit-time fallback", () => {
+  it("SDK-reported items beat the classifier (typed-not-picked path)", () => {
+    // Scenario: user types `/compact<Enter>` without picking from the
+    // popover.  classifySlashCommand alone returns "cli"; the resolver
+    // must consult the SDK-reported list first and return "native".
+    const items = buildSlashItemsFromInit(["compact"]);
+    expect(resolveSlashCommandKind("/compact", items)).toBe("native");
+  });
+
+  it("ignores trailing arguments when matching against the SDK list", () => {
+    const items = buildSlashItemsFromInit(["compact"]);
+    expect(resolveSlashCommandKind("/compact some text", items)).toBe("native");
+    expect(resolveSlashCommandKind("/compact  ", items)).toBe("native");
+  });
+
+  it("is case-insensitive (defensive)", () => {
+    const items = buildSlashItemsFromInit(["compact"]);
+    expect(resolveSlashCommandKind("/COMPACT", items)).toBe("native");
+    expect(resolveSlashCommandKind("/Compact", items)).toBe("native");
+  });
+
+  it("falls through to the classifier when SDK didn't list the verb", () => {
+    const items = buildSlashItemsFromInit([]);
+    // `/mcp` is curated as cli — appears in items as kind:"cli".
+    expect(resolveSlashCommandKind("/mcp", items)).toBe("cli");
+    expect(resolveSlashCommandKind("/mcp list", items)).toBe("cli");
+  });
+
+  it("unknown verb with no SDK match defaults to native", () => {
+    const items = buildSlashItemsFromInit([]);
+    expect(resolveSlashCommandKind("/ship", items)).toBe("native");
+    expect(resolveSlashCommandKind("/team-standup yesterday", items)).toBe("native");
+  });
+
+  it("regression: bare-string `compact` from the SDK is ALWAYS native, never cli", () => {
+    // Direct pin of the 1.3.0 user-reported bug.  This assertion must
+    // never regress: it's the entire reason this PR exists.
+    const items = buildSlashItemsFromInit(["clear", "compact", "init", "review"]);
+    for (const verb of ["/clear", "/compact", "/init", "/review"]) {
+      expect(
+        resolveSlashCommandKind(verb, items),
+        `${verb} from init.slash_commands must route native`,
+      ).toBe("native");
+    }
   });
 });

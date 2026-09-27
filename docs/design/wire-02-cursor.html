@@ -1,0 +1,57 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Spark cursor — end of assistant text</title>
+<style>
+  :root{
+    --bg-0:#1a1c20;--text-0:#f5f5f7;--text-1:#d6d6d9;--text-2:#8e8e93;
+    --brass:#ffb340;--brass-dim:rgba(255,179,64,.18);--rule:#2d2d2f;
+    --font-ui:"Inter Tight",system-ui,sans-serif;
+    --font-serif:"Newsreader",Georgia,serif;
+    --font-code:"JetBrains Mono",Menlo,monospace;
+    --ease-out-soft:cubic-bezier(.22,.61,.36,1);
+  }
+  html,body{margin:0;background:var(--bg-0);color:var(--text-1);font-family:var(--font-serif);}
+  .stage{max-width:680px;margin:64px auto;padding:24px;border:1px solid var(--rule);}
+  .stage h2{font-family:var(--font-ui);font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--text-2);margin:0 0 16px}
+  .msg{font-size:14px;line-height:1.65;color:var(--text-1);}
+  .msg p{margin:0 0 14px}
+  pre{font-family:var(--font-code);font-size:12.5px;color:var(--text-0);background:#141414;border:1px solid var(--rule);padding:12px;margin:0 0 14px;overflow:auto}
+
+  /* The spark — the only cursor */
+  .agent-cursor{
+    display:inline-block;width:.6ch;height:1.5px;margin-left:1px;
+    vertical-align:baseline;background:var(--brass);
+    box-shadow:0 0 6px 0 var(--brass-dim);
+    animation:breathe 1050ms var(--ease-out-soft) infinite alternate;
+  }
+  @keyframes breathe{from{opacity:.55}to{opacity:1}}
+  @media (prefers-reduced-motion:reduce){.agent-cursor{animation:none;opacity:.8}}
+
+  /* For comparison: the old brass square (do NOT use) */
+  .old-cursor{
+    display:inline-block;width:.6em;height:1em;margin-left:2px;vertical-align:-.1em;
+    background:var(--brass);animation:blink 1s steps(1) infinite;
+  }
+  @keyframes blink{50%{opacity:0}}
+  .label{display:block;font-family:var(--font-ui);font-size:10px;letter-spacing:.08em;
+    text-transform:uppercase;color:var(--text-2);margin:24px 0 6px}
+</style></head>
+<body>
+  <div class="stage">
+    <h2>Streaming reply · the spark cursor at rest on a fresh line</h2>
+
+    <span class="label">Proposed — spark + bleed</span>
+    <div class="msg">
+      <p>Here is the patch you asked for:</p>
+<pre>diff --git a/src/agent/AgentSessionView.tsx
+- &lt;span className="agent-cursor" /&gt;
++ &lt;span className="agent-cursor" aria-hidden /&gt;</pre>
+      <p>That should resolve the<span class="agent-cursor"></span></p>
+    </div>
+
+    <span class="label">Today — flashing brass square (problem)</span>
+    <div class="msg">
+      <p>Here is the patch you asked for:</p>
+<pre>diff …</pre>
+      <p>That should resolve the<span class="old-cursor"></span></p>
+    </div>
+  </div>
+</body></html>

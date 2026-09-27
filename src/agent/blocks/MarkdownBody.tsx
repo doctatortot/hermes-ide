@@ -70,7 +70,15 @@ export const MarkdownBody = memo(function MarkdownBody({ source }: MarkdownBodyP
           h3: ({ children }) => <h3 className="agent-md-h3">{children}</h3>,
           h4: ({ children }) => <h4 className="agent-md-h4">{children}</h4>,
           ul: ({ children }) => <ul className="agent-md-ul">{children}</ul>,
-          ol: ({ children }) => <ol className="agent-md-ol">{children}</ol>,
+          // Pass through `start` so single-item ordered lists like "4."
+          // (the model's answer to "2 + 2") render as "4." instead of
+          // "1.".  Without this, ReactMarkdown parses "4." as an
+          // <ol start="4"><li/></ol> but we'd strip the start attribute,
+          // making the bullet display as "1."  See user-reported bug
+          // where the answer to a math question rendered incorrectly.
+          ol: ({ children, start }) => (
+            <ol className="agent-md-ol" start={start}>{children}</ol>
+          ),
           li: ({ children, ...props }) => <li className="agent-md-li" {...props}>{children}</li>,
           hr: () => <hr className="agent-md-hr" />,
           p: ({ children }) => <p className="agent-md-p">{children}</p>,

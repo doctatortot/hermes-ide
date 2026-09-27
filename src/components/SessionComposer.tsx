@@ -5,7 +5,10 @@ import type { AgentAttachment } from "../utils/submitToAgent";
 import { isActionMod, isMac } from "../utils/platform";
 import { readImageForAttachment } from "../api/agent";
 import { getActiveSlashCommand, replaceSlashCommand } from "../utils/slashCommands";
-import { classifySlashCommand, missingCliBuiltins } from "../utils/slashCommandKind";
+import {
+  buildSlashItemsFromInit,
+  resolveSlashCommandKind,
+} from "../utils/slashCommandKind";
 import { fuzzyRank } from "../utils/fuzzy";
 import { SlashCommandsDropdown, type SlashCommandItem } from "./SlashCommandsDropdown";
 import { CliCommandBanner } from "./CliCommandBanner";
@@ -14,12 +17,12 @@ import { ModelPicker } from "./ModelPicker";
 import { PermissionPicker, CLAUDE_PERMISSION_MODES } from "./PermissionPicker";
 import { EffortPicker } from "./EffortPicker";
 import { CLAUDE_MODEL_OPTIONS } from "../agent/modelOptions";
+import { useI18n } from "../i18n/I18nProvider";
 
 /** Claude's published `--effort` levels (verified via `claude --help`). */
 const CLAUDE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 import { useAgentInit } from "../agent/useAgentInit";
 import { useAgentPrewarm } from "../agent/useAgentPrewarm";
-import { mergeSlashCommands } from "../utils/prewarm";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 
 let composerTextarea: HTMLTextAreaElement | null = null;
@@ -85,6 +88,7 @@ interface PendingImage {
 }
 
 export function SessionComposer() {
+  const { t } = useI18n();
   const { state, dispatch, switchAgentModel, switchAgentPermissionMode, switchAgentEffort, submitAgentMessage } = useSession();
   const sessionId = state.activeSessionId;
   const session = sessionId ? state.sessions[sessionId] : null;
@@ -127,63 +131,28 @@ export function SessionComposer() {
   // surfaces the kind as a badge so the user knows up-front whether
   // accepting the item will send a chat message or pop a terminal.
   const slashCommandsFromInit = useMemo<SlashCommandItem[]>(() => {
-    // Two-source merge:
+    // Two-source merge (delegated to `buildSlashItemsFromInit`):
     //   1. Live: whatever the SDK reports in `init.slash_commands`.
-    //      This is the only truly version-matched source — picks up
-    //      every plugin / skill / user command the user has installed.
+    //      Authoritatively native — these are the verbs the SDK says
+    //      run over stream-json.  Bare-string entries (the SDK's most
+    //      common shape) get `kind: "native"` BEFORE any classifier
+    //      runs, so name-collisions with KNOWN_CLI_COMMANDS no longer
+    //      mis-route `/compact`, `/clear`, `/init`, `/review` to the
+    //      embedded-terminal path.  Regression: see
+    //      `slash-command-kind.test.ts` § buildSlashItemsFromInit.
     //   2. Curated: the well-known Claude Code CLI-only built-ins
     //      (`/mcp`, `/agents`, `/login`, etc.) that the SDK omits
-    //      because they don't work over stream-json.  The binary
-    //      doesn't expose an enumeration API, so Conductor and other
-    //      clients curate the same list — see CLAUDE_CLI_BUILTINS in
-    //      slashCommandKind.ts.
-    //   The merge is deduped: if the SDK does report a name, it
-    //   wins (we trust the SDK's description over ours).
-    const raw = init?.slash_commands;
-    let items: SlashCommandItem[];
-    if (Array.isArray(raw)) {
-      items = raw
-        .map((entry): SlashCommandItem | null => {
-          if (typeof entry === "string") {
-            const command = entry.startsWith("/") ? entry : `/${entry}`;
-            return { command, label: "", description: "", source: "builtin" };
-          }
-          if (entry && typeof entry === "object") {
-            const command = typeof entry.command === "string"
-              ? (entry.command.startsWith("/") ? entry.command : `/${entry.command}`)
-              : null;
-            if (!command) return null;
-            const description = typeof entry.description === "string" ? entry.description : "";
-            return { command, label: "", description, source: "builtin" };
-          }
-          return null;
-        })
-        .filter((c): c is SlashCommandItem => c !== null);
-    } else {
-      const merged = mergeSlashCommands(prewarm.slashCommands, undefined);
-      items = merged.map((cmd) => ({
-        command: cmd.startsWith("/") ? cmd : `/${cmd}`,
-        label: "",
-        description: "",
-        source: "builtin" as const,
-      }));
-    }
-    // Append curated CLI built-ins that the SDK didn't include.
-    // These are interactive-only by definition — mark them `cli`
-    // explicitly so the classifier doesn't get tripped up by their
-    // descriptions (which don't carry a CLI hint phrase).
-    for (const builtin of missingCliBuiltins(items)) {
-      items.push({
-        command: builtin.command,
-        label: "",
-        description: builtin.description,
-        source: "builtin",
-        kind: "cli",
-      });
-    }
-    // Items already marked (catalog) keep their kind.  Everything
-    // else runs through the classifier.
-    return items.map((it) => ({ ...it, kind: it.kind ?? classifySlashCommand(it) }));
+    //      because they don't work over stream-json.
+    const rawInit = init?.slash_commands;
+    const rawForBuilder = Array.isArray(rawInit) ? rawInit : undefined;
+    const resolved = buildSlashItemsFromInit(rawForBuilder, prewarm.slashCommands);
+    return resolved.map((r) => ({
+      command: r.command,
+      label: "",
+      description: r.description,
+      source: r.source,
+      kind: r.kind,
+    }));
   }, [init, prewarm.slashCommands]);
 
   // ─── Active slash overlay state ─────────────────────────────────────
@@ -291,8 +260,11 @@ export function SessionComposer() {
     // stream-json mode.
     const trimmed = draft.trim();
     if (trimmed.startsWith("/")) {
-      const firstToken = trimmed.split(/\s+/, 1)[0]!;
-      const kind = classifySlashCommand({ command: firstToken });
+      // Prefer the SDK's verdict over the heuristic classifier: if
+      // `init.slash_commands` enumerated this verb, it's native
+      // regardless of what KNOWN_CLI_COMMANDS would say.  Falls back
+      // to the classifier when the SDK doesn't list the verb.
+      const kind = resolveSlashCommandKind(trimmed, slashCommandsFromInit);
       if (kind === "cli") {
         dispatch({ type: "SET_COMPOSER_DRAFT", sessionId: composerSessionId, draft: "" });
         setPendingCliCommand(trimmed);
@@ -320,7 +292,7 @@ export function SessionComposer() {
     } finally {
       inFlightRef.current = false;
     }
-  }, [draft, composerSessionId, pendingImages, dispatch, closeOverlay, submitAgentMessage]);
+  }, [draft, composerSessionId, pendingImages, dispatch, closeOverlay, submitAgentMessage, slashCommandsFromInit]);
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (slash && rankedCommands && rankedCommands.length > 0) {
@@ -335,6 +307,31 @@ export function SessionComposer() {
       e.stopPropagation();
       void handleSubmit();
       return;
+    }
+    // Plain Enter sends; Shift+Enter inserts a newline.  This matches
+    // the chat-app convention (Claude.ai, ChatGPT, Cursor, Slack,
+    // Discord) that the agent composer competes with.  Cmd/Ctrl+Enter
+    // above remains as a compat path for users who learned the older
+    // binding.
+    //
+    // Skip the send when:
+    //   - any modifier other than Shift is held (Shift is reserved for
+    //     newline; Cmd/Ctrl is handled above; Alt is the wildcard for
+    //     OS-level shortcuts we don't want to swallow)
+    //   - an IME composition is in progress — the Enter is committing
+    //     a codepoint (CJK, dead-keys, voice dictation), not the
+    //     message.  Both `isComposingRef.current` and the native
+    //     `isComposing` flag are checked; WebKit doesn't always set
+    //     the native flag in the right places.
+    if (e.key === "Enter" && !e.shiftKey && !e.altKey) {
+      const native = e.nativeEvent as KeyboardEvent | undefined;
+      const composing = isComposingRef.current || native?.isComposing === true;
+      if (!composing) {
+        e.preventDefault();
+        e.stopPropagation();
+        void handleSubmit();
+        return;
+      }
     }
     if (e.key === "Escape") {
       e.preventDefault();
@@ -533,12 +530,12 @@ export function SessionComposer() {
     setModelSwitchError(null);
     try {
       const ok = await switchAgentModel(composerSessionId, target);
-      if (!ok) setModelSwitchError("Model switch failed — keeping current model.");
+      if (!ok) setModelSwitchError(t("composer.modelSwitchFailed"));
     } catch (err) {
       console.error("[SessionComposer] switchAgentModel rejected:", err);
       setModelSwitchError(err instanceof Error ? err.message : String(err));
     }
-  }, [composerSessionId, switchAgentModel]);
+  }, [composerSessionId, switchAgentModel, t]);
 
   // Drop the optimistic indicator once the next init event reports the
   // requested model — that's confirmation the new subprocess is up.
@@ -577,12 +574,12 @@ export function SessionComposer() {
     setPermSwitchError(null);
     try {
       const ok = await switchAgentPermissionMode(composerSessionId, mode);
-      if (!ok) setPermSwitchError("Permission swap failed — keeping current mode.");
+      if (!ok) setPermSwitchError(t("composer.permissionSwitchFailed"));
     } catch (err) {
       console.error("[SessionComposer] switchAgentPermissionMode rejected:", err);
       setPermSwitchError(err instanceof Error ? err.message : String(err));
     }
-  }, [composerSessionId, switchAgentPermissionMode]);
+  }, [composerSessionId, switchAgentPermissionMode, t]);
 
   // Once Claude reports the new mode in its init event, drop the optimistic
   // pending indicator.
@@ -616,7 +613,7 @@ export function SessionComposer() {
     setEffortSwitchError(null);
     try {
       const ok = await switchAgentEffort(composerSessionId, level);
-      if (!ok) setEffortSwitchError("Effort swap failed — keeping current level.");
+      if (!ok) setEffortSwitchError(t("composer.effortSwitchFailed"));
       else setActiveEffort(level);
     } catch (err) {
       console.error("[SessionComposer] switchAgentEffort rejected:", err);
@@ -627,7 +624,7 @@ export function SessionComposer() {
       // user-selected level as the source of truth.
       setTimeout(() => setPendingEffort(null), 1500);
     }
-  }, [composerSessionId, switchAgentEffort]);
+  }, [composerSessionId, switchAgentEffort, t]);
 
   useEffect(() => {
     setPendingEffort(null);
@@ -762,13 +759,13 @@ export function SessionComposer() {
           type="button"
           className="session-composer-fab"
           onClick={() => dispatch({ type: "SET_COMPOSER_EXPANDED", sessionId: composerSessionId, expanded: true })}
-          title={`Open composer (${isMac ? "⌘⇧J" : "Ctrl+Shift+J"})`}
-          aria-label="Open composer"
+          title={t("composer.openComposerTitle", { shortcut: isMac ? "⌘⇧J" : "Ctrl+Shift+J" })}
+          aria-label={t("composer.openComposer")}
         >
           <svg className="session-composer-fab-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
             <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
           </svg>
-          <span className="session-composer-fab-label">Compose</span>
+          <span className="session-composer-fab-label">{t("composer.compose")}</span>
           <span className="session-composer-fab-kbd" aria-hidden="true">
             <kbd>{isMac ? "⌘" : "Ctrl"}</kbd><kbd>⇧</kbd><kbd>J</kbd>
           </span>
@@ -793,8 +790,8 @@ export function SessionComposer() {
   const showSlash = slash !== null && rankedCommands !== null;
 
   const placeholder = sessionLabel
-    ? `Message ${sessionLabel}…  (/ for commands)`
-    : "Type a message…";
+    ? t("composer.messagePlaceholder", { label: sessionLabel })
+    : t("composer.typeMessagePlaceholder");
 
   const liveModel = init?.model ?? null;
 
@@ -806,7 +803,7 @@ export function SessionComposer() {
   const compactModel = (m: string | null): string | null => {
     if (!m) return m;
     const lower = m.toLowerCase();
-    const match = /^claude-(opus|haiku|sonnet)-/.exec(lower);
+    const match = /^claude-(opus|haiku|sonnet|fable)-/.exec(lower);
     return match ? match[1] : m;
   };
 
@@ -829,7 +826,7 @@ export function SessionComposer() {
         className="session-composer-resize-handle"
         role="separator"
         aria-orientation="horizontal"
-        aria-label="Resize composer"
+        aria-label={t("composer.resize")}
         onMouseDown={handleResizeMouseDown}
       />
       {pendingCliCommand && !activeTerminal && (
@@ -861,8 +858,8 @@ export function SessionComposer() {
             type="button"
             className="session-composer-window-btn"
             onClick={toggleMaximize}
-            title={maximized ? "Restore" : "Maximize"}
-            aria-label={maximized ? "Restore composer" : "Maximize composer"}
+            title={maximized ? t("composer.restore") : t("composer.maximize")}
+            aria-label={maximized ? t("composer.restoreComposer") : t("composer.maximizeComposer")}
           >
             {maximized ? (
               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -884,8 +881,8 @@ export function SessionComposer() {
             type="button"
             className="session-composer-window-btn"
             onClick={minimizeComposer}
-            title="Minimize to icon"
-            aria-label="Minimize composer"
+            title={t("composer.minimizeToIcon")}
+            aria-label={t("composer.minimizeComposer")}
           >
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
               <line x1="5" y1="12" x2="19" y2="12" />
@@ -902,14 +899,14 @@ export function SessionComposer() {
           />
         )}
         {showSlash && rankedCommands!.length === 0 && (
-          <div className="slash-dropdown" role="listbox" aria-label="Slash commands">
+          <div className="slash-dropdown" role="listbox" aria-label={t("composer.slashCommands")}>
             <div className="slash-dropdown-empty">
-              No commands available yet — Claude will publish them once it's ready.
+              {t("composer.noSlashCommands")}
             </div>
           </div>
         )}
         {pendingImages.length > 0 && (
-          <div className="session-composer-attachments" aria-label="Attached images">
+          <div className="session-composer-attachments" aria-label={t("composer.attachedImages")}>
             {pendingImages.map((img) => {
               const dataUrl = `data:${img.mediaType};base64,${img.base64}`;
               return (
@@ -919,8 +916,8 @@ export function SessionComposer() {
                     type="button"
                     className="session-composer-attachment-remove"
                     onClick={() => removePendingImage(img.id)}
-                    title="Remove image"
-                    aria-label="Remove pasted image"
+                    title={t("composer.removeImage")}
+                    aria-label={t("composer.removePastedImage")}
                   >×</button>
                 </div>
               );
@@ -939,7 +936,7 @@ export function SessionComposer() {
           onCompositionEnd={handleCompositionEnd}
           onBlur={handleBlur}
           placeholder={placeholder}
-          aria-label="Compose agent message"
+          aria-label={t("composer.composeAgentMessage")}
           spellCheck={false}
           autoComplete="off"
           autoCorrect="off"
@@ -951,10 +948,10 @@ export function SessionComposer() {
               type="button"
               className="session-composer-builder-btn"
               onClick={openPromptBuilder}
-              title={`Open prompt builder (${isMac ? "⌘J" : "Ctrl+J"})`}
-              aria-label="Open prompt builder"
+              title={t("composer.openPromptBuilderTitle", { shortcut: isMac ? "⌘J" : "Ctrl+J" })}
+              aria-label={t("composer.openPromptBuilder")}
             >
-              ✨ Builder
+              ✨ {t("composer.builder")}
             </button>
             {/* Ad-hoc shell terminal — opens the same embedded PTY
                 the slash-CLI banner uses, but spawns the user's
@@ -969,11 +966,11 @@ export function SessionComposer() {
                   cur && cur.kind === "shell" ? null : { kind: "shell" },
                 );
               }}
-              title="Toggle inline shell terminal"
-              aria-label="Toggle inline shell terminal"
+              title={t("composer.toggleTerminal")}
+              aria-label={t("composer.toggleTerminal")}
               aria-pressed={activeTerminal?.kind === "shell"}
             >
-              ›_ Terminal
+              ›_ {t("composer.terminal")}
             </button>
             {/* Attach-by-button — explicit affordance for the same
                 image-attachment flow that paste/drop already use.  The
@@ -984,8 +981,8 @@ export function SessionComposer() {
               type="button"
               className="session-composer-attach-btn"
               onClick={openFilePicker}
-              title="Attach image (PNG, JPG, GIF, WebP, BMP)"
-              aria-label="Attach image"
+              title={t("composer.attachImageHint")}
+              aria-label={t("composer.attachImage")}
             >
               <svg
                 viewBox="0 0 24 24"
@@ -998,7 +995,7 @@ export function SessionComposer() {
               >
                 <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
               </svg>
-              <span className="session-composer-attach-label">Attach</span>
+              <span className="session-composer-attach-label">{t("composer.attach")}</span>
             </button>
             <input
               ref={fileInputRef}
@@ -1024,8 +1021,8 @@ export function SessionComposer() {
                   onClick={() => setModelPickerOpen((o) => !o)}
                   // Full id in the tooltip so the user can still see it without
                   // the long string blowing out the row.
-                  title={`Switch model — current: ${pendingModel ?? liveModel ?? ""}`}
-                  aria-label={`Switch model (current: ${pendingModel ?? liveModel ?? ""})`}
+                  title={t("composer.switchModel", { model: pendingModel ?? liveModel ?? "" })}
+                  aria-label={t("composer.switchModel", { model: pendingModel ?? liveModel ?? "" })}
                   aria-expanded={modelPickerOpen}
                   aria-haspopup="menu"
                 >
@@ -1052,7 +1049,7 @@ export function SessionComposer() {
                 className="session-composer-perm-chip session-composer-perm-chip-danger"
                 title={modelSwitchError}
               >
-                model swap failed
+                {t("composer.modelSwapFailed")}
               </span>
             )}
             {/* Permission-mode picker.  Click → opens the PermissionPicker
@@ -1073,8 +1070,8 @@ export function SessionComposer() {
                     type="button"
                     className={`session-composer-perm-chip-btn composer-chip composer-chip-perms${pendingPerm ? " session-composer-perm-chip-btn-pending" : ""}${isDanger ? " session-composer-perm-chip-btn-danger composer-chip-danger" : ""}`}
                     onClick={() => setPermPickerOpen((o) => !o)}
-                    title={`Permission mode: ${meta.label} — click to switch`}
-                    aria-label={`Permission mode: ${meta.label}`}
+                    title={t("composer.permissionModeTitle", { mode: meta.label })}
+                    aria-label={t("composer.permissionMode", { mode: meta.label })}
                     aria-haspopup="menu"
                     aria-expanded={permPickerOpen}
                   >
@@ -1101,7 +1098,7 @@ export function SessionComposer() {
                 className="session-composer-perm-chip session-composer-perm-chip-danger"
                 title={permSwitchError}
               >
-                permission swap failed
+                {t("composer.permissionSwapFailed")}
               </span>
             )}
 
@@ -1110,7 +1107,7 @@ export function SessionComposer() {
                 neutral "Effort" label until the user picks one; click to
                 cycle/pick. */}
             {(liveModel || pendingModel) && (() => {
-              const effortLabel = pendingEffort ?? activeEffort ?? "Effort";
+              const effortLabel = pendingEffort ?? activeEffort ?? t("composer.effort");
               return (
                 <div className="session-composer-perm-wrap">
                   <button
@@ -1118,8 +1115,8 @@ export function SessionComposer() {
                     type="button"
                     className={`session-composer-perm-chip-btn composer-chip composer-chip-effort${pendingEffort ? " session-composer-perm-chip-btn-pending" : ""}`}
                     onClick={() => setEffortPickerOpen((o) => !o)}
-                    title="Thinking effort — respawns Claude with --effort"
-                    aria-label={`Effort: ${effortLabel}`}
+                    title={t("composer.effortTitle")}
+                    aria-label={t("composer.effortLevel", { level: effortLabel })}
                     aria-haspopup="menu"
                     aria-expanded={effortPickerOpen}
                   >
@@ -1148,13 +1145,13 @@ export function SessionComposer() {
                 className="session-composer-perm-chip session-composer-perm-chip-danger"
                 title={effortSwitchError}
               >
-                effort swap failed
+                {t("composer.effortSwapFailed")}
               </span>
             )}
             {isConnecting && (
               <>
                 <span className="session-composer-status-dot" aria-hidden="true" />
-                <span>connecting…</span>
+                <span>{t("composer.connecting")}</span>
               </>
             )}
           </div>
@@ -1163,10 +1160,10 @@ export function SessionComposer() {
             className="session-composer-send-btn"
             onClick={() => void handleSubmit()}
             disabled={!draft.trim() && pendingImages.length === 0}
-            title={`Send (${isMac ? "⌘" : "Ctrl"}+Enter)`}
-            aria-label="Send message"
+            title={t("composer.sendTitle")}
+            aria-label={t("composer.sendMessage")}
           >
-            <span className="session-composer-send-label">Send</span>
+            <span className="session-composer-send-label">{t("composer.send")}</span>
             <svg
               className="session-composer-send-arrow"
               viewBox="0 0 24 24"
