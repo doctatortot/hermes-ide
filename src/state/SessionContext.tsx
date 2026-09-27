@@ -21,6 +21,7 @@ import { getProjects, getSessionProjects, attachSessionProject } from "../api/pr
 import { autoAttachInsideProject } from "../utils/autoAttach";
 import { hasAddDirDrift } from "../utils/agentDrift";
 import { createWorktree, worktreeHasChanges, stashWorktree, getSessionWorktreeInfo } from "../api/git";
+import type { SessionWorktree } from "../types/git";
 import { getSettings, getSetting, setSetting } from "../api/settings";
 import { createTerminal, destroy as destroyTerminal, writeScrollback, estimateInitialDimensions } from "../terminal/TerminalPool";
 import { applyTheme, applyAgentTimelineStyle } from "../utils/themeManager";
@@ -61,6 +62,7 @@ import { spawnAgentSession, closeAgentSession, sendAgentInput, updateHermesState
 import { reportAgentSpawnFailure } from "../utils/agentSpawnFailure";
 import { destroyAgentSessionStore } from "../agent/agentSessionStore";
 import { cleanupSessionRefs } from "../utils/sessionRefCleanup";
+import { cacheAgentInit, clearAgentInitCache, peekAgentInitCache } from "../agent/useAgentInit";
 import {
   buildUserEnvelope,
   echoUserEnvelope,
@@ -68,6 +70,191 @@ import {
   type AgentAttachment,
 } from "../utils/submitToAgent";
 import { sendAgentEnvelopeWithRevive } from "../utils/sendAgentEnvelope";
+
+// ─── Mode-conversion worktree-preservation helper ────────────────────
+
+/**
+ * Decide whether a session-mode conversion needs to restore worktrees
+ * after teardown but before respawn.
+ *
+ * Bug 4 (1.2.x):
+ *   - Terminal close runs `apiCloseSession`, which (after Bug 1's fix)
+ *     unconditionally cleans worktrees from disk + DB.  If the next
+ *     step is to spawn an agent in the OLD `session.working_directory`,
+ *     that directory no longer exists and the subprocess fails to boot.
+ *   - Agent close runs `closeAgentSession`, which only kills the
+ *     bridge subprocess and leaves `session_worktrees` rows alone.
+ *     The subsequent `apiCreateSession` finds the row and resolves cwd
+ *     correctly — no restore is needed.
+ *
+ * Exported so the decision can be unit-tested without a React tree.
+ */
+export type ConversionWorktreePlan = "restore-before-spawn" | "no-op";
+
+export function planConversionWorktreeRestore(args: {
+  currentMode: SessionMode;
+  newMode: SessionMode;
+}): ConversionWorktreePlan {
+  if (args.currentMode === args.newMode) return "no-op";
+  // Only the terminal → agent direction loses the worktree to
+  // apiCloseSession's cleanup.
+  if (args.currentMode === "terminal" && args.newMode === "agent") {
+    return "restore-before-spawn";
+  }
+  return "no-op";
+}
+
+/**
+ * Snapshot of an isolated worktree the session owns, captured BEFORE a
+ * mode-conversion teardown so it can be re-created afterwards.
+ *
+ * Main worktrees (project root) and worktrees with no branch info are
+ * skipped — they don't need re-creation.
+ */
+export interface PreservedWorktreeEntry {
+  projectId: string;
+  branchName: string;
+}
+
+/**
+ * Capture every isolated worktree row linked to `sessionId` so the caller
+ * can re-create them after `apiCloseSession` wipes the disk + DB state.
+ *
+ * Non-throwing: a transient DB / IPC error here must NOT prevent the
+ * conversion from proceeding — at worst the session re-spawns without
+ * isolation (the pre-fix behaviour, which is itself surfaced by
+ * Bug 3's defence-in-depth).  We return whatever we managed to collect.
+ *
+ * See Bug 4 in `docs/internal/agent-mode-bug-1-2-x-regressions.md`.
+ */
+export async function snapshotPreservableWorktrees(
+  sessionId: string,
+): Promise<PreservedWorktreeEntry[]> {
+  let projects: Array<{ id: string }> = [];
+  try {
+    projects = await getSessionProjects(sessionId);
+  } catch (err) {
+    console.warn("[SessionContext] snapshotPreservableWorktrees: getSessionProjects failed:", err);
+    return [];
+  }
+
+  const preserved: PreservedWorktreeEntry[] = [];
+  for (const project of projects) {
+    let wt: SessionWorktree | null = null;
+    try {
+      wt = await getSessionWorktreeInfo(sessionId, project.id);
+    } catch (err) {
+      console.warn(
+        `[SessionContext] snapshotPreservableWorktrees: getSessionWorktreeInfo failed for project ${project.id}:`,
+        err,
+      );
+      continue;
+    }
+    if (!wt) continue;
+    if (wt.isMainWorktree) continue; // Main worktrees don't need re-creation
+    if (!wt.branchName) continue;     // Can't re-create without a branch
+    preserved.push({ projectId: wt.projectId, branchName: wt.branchName });
+  }
+  return preserved;
+}
+
+/**
+ * Re-create the worktrees captured by `snapshotPreservableWorktrees`,
+ * after `apiCloseSession` has run.  Individual failures are logged but
+ * not propagated — restoring 2/3 worktrees is strictly better than
+ * aborting the whole conversion because of one transient error.
+ *
+ * Called between the close step and the spawn step in
+ * `convertSessionMode` so the new subprocess sees a populated
+ * `session_worktrees` table and an existing worktree directory.
+ */
+export async function restorePreservedWorktrees(
+  sessionId: string,
+  preserved: PreservedWorktreeEntry[],
+): Promise<void> {
+  for (const wt of preserved) {
+    try {
+      await createWorktree(sessionId, wt.projectId, wt.branchName, false);
+    } catch (err) {
+      console.warn(
+        `[SessionContext] restorePreservedWorktrees: createWorktree failed for project ${wt.projectId} (branch ${wt.branchName}):`,
+        err,
+      );
+    }
+  }
+}
+
+// ─── Worktree-failure escalation helper ─────────────────────────────
+
+/**
+ * Decide whether a session creation MUST abort because every requested
+ * worktree failed to be created.
+ *
+ * Bug 3 (1.2.x): when the user picked branches but every `createWorktree`
+ * threw, `createSession` previously caught each error and proceeded to
+ * call `apiCreateSession` anyway.  The backend then resolved cwd to the
+ * project root (no session_worktrees row was inserted), and the agent
+ * session booted on the current branch with no isolation — exactly the
+ * symptom the user reported as "the branch I selected is not selected,
+ * keeps the old one, no worktrees".
+ *
+ * Decision rule: fatal iff there was at least one error AND zero
+ * successes.  Partial successes proceed (the surviving projects get
+ * isolation; the rest are surfaced via the `hermes:worktree-errors`
+ * event).  Zero errors + zero successes is the legacy "no branch
+ * selection" path and must NOT abort.
+ *
+ * Exported so the decision is unit-testable without rendering the
+ * SessionProvider.
+ */
+export function worktreeFailureIsFatal(args: {
+  succeeded: number;
+  errorCount: number;
+}): boolean {
+  return args.errorCount > 0 && args.succeeded === 0;
+}
+
+// ─── Agent-aware close helper ────────────────────────────────────────
+
+/**
+ * Tear down a session's subprocess(es) + backend state in the order that
+ * is safe for each mode.
+ *
+ * Agent-mode sessions run as a Node bridge subprocess registered with
+ * `AgentState` on the Rust side; that subprocess is NOT tracked in the
+ * PTY manager and therefore is invisible to the Tauri `close_session`
+ * command. Closing only via `close_session` would leak the subprocess
+ * (zombie) and — until the backend `close_session` is extended to run
+ * unconditional worktree cleanup — also leak worktree state.
+ *
+ * For agent-mode sessions we therefore:
+ *   1. Call `close_agent_session` first so the bridge gets EOF, exits
+ *      gracefully (or is killed after 1s), and is removed from
+ *      `AgentState`. Errors here are non-fatal: "session not found"
+ *      means the subprocess already exited.
+ *   2. Call `close_session` second so the backend can clean up
+ *      worktrees, DB rows, pins, and emit `session-removed`.
+ *
+ * Terminal-mode sessions only need `close_session`; the PTY child is
+ * tracked in the PTY manager and killed inside that command.
+ *
+ * Exported separately from `closeSession` so the ordering can be
+ * exercised in tests without rendering the SessionProvider.
+ */
+export async function performAgentAwareClose(
+  sessionId: string,
+  mode: SessionMode,
+): Promise<void> {
+  if (mode === "agent") {
+    await closeAgentSession(sessionId).catch((err) => {
+      // The bridge may already have exited (crash, manual kill, etc.).
+      // We still need to call apiCloseSession so the backend cleans up
+      // worktrees and DB rows — don't propagate.
+      console.warn("[SessionContext] closeAgentSession failed (continuing):", err);
+    });
+  }
+  await apiCloseSession(sessionId);
+}
 
 // ─── Workspace Restore Helpers ───────────────────────────────────────
 
@@ -1042,6 +1229,13 @@ export function SessionProvider({ children }: { children: ReactNode }) {
             if (typeof event.permissionMode === "string") {
               claudePermissionModes.current.set(sessionId, event.permissionMode);
             }
+            // Bug 5 (1.2.x): mirror the init into the module-level
+            // cache `useAgentInit` reads on mount.  The init event
+            // fires ONCE per spawn and Tauri does not replay to late
+            // subscribers; without this write, the composer's
+            // model/permission/effort chips vanish for any session
+            // the user navigates to after its initial spawn.
+            cacheAgentInit(sessionId, event);
           } else if (isStateChangedEvent(event)) {
             console.log(
               `[state-changed] sid=${sessionId} model=${event.model ?? "?"}` +
@@ -1065,6 +1259,19 @@ export function SessionProvider({ children }: { children: ReactNode }) {
                   session: { ...existing, permission_mode: event.permissionMode },
                 });
               }
+            }
+            // Patch the cached init snapshot too so a late-mounting
+            // composer (e.g. switching to the session AFTER plan-mode
+            // was entered) sees the current permissionMode, not the
+            // stale spawn-time value.
+            const cached = peekAgentInitCache(sessionId);
+            if (cached) {
+              const patched = { ...cached };
+              if (typeof event.model === "string") patched.model = event.model;
+              if (typeof event.permissionMode === "string") {
+                patched.permissionMode = event.permissionMode;
+              }
+              cacheAgentInit(sessionId, patched);
             }
           }
         },
@@ -1259,6 +1466,10 @@ export function SessionProvider({ children }: { children: ReactNode }) {
         // Tear down the long-lived agent message store so its Tauri
         // listeners don't leak after the session is gone.
         destroyAgentSessionStore(event.payload);
+        // Release the module-level init cache entry (Bug 5 fix) —
+        // otherwise the Map grows unbounded across long-running app
+        // sessions.
+        clearAgentInitCache(event.payload);
         dispatch({ type: "SESSION_REMOVED", id: event.payload });
       });
       unlisteners.push(u2);
@@ -1514,6 +1725,11 @@ export function SessionProvider({ children }: { children: ReactNode }) {
       // Create worktrees for each git project with a branch selection
       const sharedBranches: string[] = [];
       const worktreeErrors: string[] = [];
+      // Bug 3 (1.2.x): count successes so we can abort if EVERY worktree
+      // failed.  Previously the loop swallowed every error and let
+      // `apiCreateSession` proceed; the backend silently used the
+      // project root and the agent session booted with no isolation.
+      let worktreesSucceeded = 0;
       if (opts?.branchSelections && opts?.projectIds?.length) {
         for (const projectId of opts.projectIds) {
           const sel = opts.branchSelections[projectId];
@@ -1523,10 +1739,29 @@ export function SessionProvider({ children }: { children: ReactNode }) {
             if (wtResult.isShared) {
               sharedBranches.push(sel.branch);
             }
+            worktreesSucceeded++;
           } catch (wtErr) {
             console.warn(`[SessionContext] Failed to create worktree for project ${projectId}:`, wtErr);
             worktreeErrors.push(`${projectId}: ${wtErr}`);
           }
+        }
+
+        // Hard-abort when every selected worktree failed.  Returning
+        // null here surfaces the failure to the caller (command palette
+        // / NewSessionButton) instead of silently creating a session on
+        // the wrong branch.  Note: the legacy `opts?.branchName` path
+        // below intentionally does NOT participate in this gate — it
+        // pre-dates the branch-selections API and is best-effort by
+        // design.
+        if (worktreeFailureIsFatal({
+          succeeded: worktreesSucceeded,
+          errorCount: worktreeErrors.length,
+        })) {
+          destroyTerminal(preSessionId);
+          window.dispatchEvent(new CustomEvent("hermes:worktree-errors", {
+            detail: { errors: worktreeErrors, sessionLabel: opts?.label, fatal: true },
+          }));
+          return null;
         }
       } else if (opts?.branchName && opts?.projectIds?.length) {
         // Legacy: single branch for first project (backward compatibility)
@@ -1673,8 +1908,13 @@ export function SessionProvider({ children }: { children: ReactNode }) {
   const closeSession = useCallback(async (id: string) => {
     if (closingSessionIds.current.has(id)) return; // Prevent double-close race
     closingSessionIds.current.add(id);
+    // Snapshot the mode BEFORE the backend tears down session state.
+    // After close_session emits `session-removed` and the reducer drops
+    // the entry, `state.sessions[id]` is gone and we can't tell whether
+    // we needed to kill an agent subprocess too.
+    const mode = stateRef.current.sessions[id]?.mode ?? "terminal";
     try {
-      await apiCloseSession(id);
+      await performAgentAwareClose(id, mode);
     } catch (err) {
       console.error("Failed to close session:", err);
     } finally {
@@ -1903,6 +2143,26 @@ export function SessionProvider({ children }: { children: ReactNode }) {
       return false;
     }
 
+    // Bug 4 (1.2.x): when the close half of the conversion is
+    // `apiCloseSession` (terminal mode), Bug 1's unconditional cleanup
+    // strips the session's worktree from disk AND from the
+    // `session_worktrees` table.  The follow-up `spawnAgentSession`
+    // would then boot in a deleted directory.  Snapshot the worktree
+    // info BEFORE close so we can restore it after.
+    //
+    // The two helpers `snapshotPreservableWorktrees` and
+    // `restorePreservedWorktrees` are exported from this file and unit-
+    // tested in `convert-mode-worktree-preservation.test.ts` — keep them
+    // and this call site in lock-step.
+    const plan = planConversionWorktreeRestore({
+      currentMode: session.mode,
+      newMode,
+    });
+    const worktreeRestores: PreservedWorktreeEntry[] =
+      plan === "restore-before-spawn"
+        ? await snapshotPreservableWorktrees(sessionId)
+        : [];
+
     try {
       // 1. Close whatever process is currently running for this session.
       if (session.mode === "agent") {
@@ -1920,6 +2180,15 @@ export function SessionProvider({ children }: { children: ReactNode }) {
         await apiCloseSession(sessionId).catch((err) => {
           console.warn("[SessionContext] Failed to close terminal during conversion:", err);
         });
+      }
+
+      // 1b. Restore worktrees the close just nuked (terminal → agent only).
+      // Errors are non-fatal: we log and let the spawn proceed; the
+      // backend will fall back to the project root and the user will see
+      // a missing-isolation warning if Bug 3's defence-in-depth is
+      // active.  Better than failing the conversion entirely.
+      if (worktreeRestores.length > 0) {
+        await restorePreservedWorktrees(sessionId, worktreeRestores);
       }
 
       // 2. Flip the mode in state so SplitPane re-renders the right view.

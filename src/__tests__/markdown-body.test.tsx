@@ -63,6 +63,15 @@ describe("<MarkdownBody> — block elements", () => {
     expect(out).toMatch(/second/);
   });
 
+  it("preserves the `start` attribute on ordered lists (so '4.' renders as 4, not 1)", () => {
+    // Real-world regression: the model's answer to "2 + 2" was "4.",
+    // which the parser treats as an ordered list starting at 4.  If
+    // we don't forward the `start` attribute on <ol>, the browser
+    // renumbers from 1.
+    const out = html("4. four");
+    expect(out).toMatch(/start="4"/);
+  });
+
   it("renders blockquotes", () => {
     const out = html("> quoted text");
     expect(out).toContain('class="agent-md-blockquote"');

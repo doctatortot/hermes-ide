@@ -28,6 +28,8 @@ import type {
   InitEvent,
   RateLimitInfo,
   ResultEvent,
+  TextBlockData,
+  ThinkingBlockData,
   ToolResultBlockData,
   UserEvent,
 } from "./types";
@@ -119,6 +121,8 @@ export interface AgentSessionState {
    *  *bridge process's* lifetime, which with the long-lived bridge equals
    *  the user's session.  Reset on workspace restore. */
   cumulativeCostUsd: number;
+  /** Same idea for input tokens. Used by the Usage panel after it opens late. */
+  cumulativeInputTokens: number;
   /** Same idea for output tokens — quick "how much have I gotten back?" */
   cumulativeOutputTokens: number;
   /** Account info from the SDK's `query.accountInfo()`.  Captured once
@@ -156,6 +160,7 @@ export interface AgentSessionState {
 export function emptyState(): AgentSessionState {
   return {
     cumulativeCostUsd: 0,
+    cumulativeInputTokens: 0,
     cumulativeOutputTokens: 0,
     accountInfo: null,
     rateLimits: {},
@@ -259,19 +264,13 @@ function mergeAssistantBlocks(
 
     if (isThinkingBlock(block)) {
       const sig = (block as { signature?: unknown }).signature;
-      if (typeof sig === "string" && sig.length > 0) {
-        const dup = current.some(
-          (b) =>
-            isThinkingBlock(b) &&
-            (b as { signature?: unknown }).signature === sig,
-        );
-        if (dup) continue;
-        target().push(block);
-        continue;
-      }
-      // Replace an empty-thinking placeholder at the same index with the
-      // non-empty version (newer-SDK pattern: empty event lands first,
-      // text-bearing event arrives later).
+      // Replace an empty-thinking placeholder at the same index with
+      // the non-empty version.  This runs FIRST, regardless of whether
+      // the new block has a signature — without it, the placeholder
+      // that the stream-partial reducer synthesizes on
+      // `content_block_start|thinking` would never be replaced (the
+      // real assistant event arrives with both a signature AND real
+      // text, which used to skip this branch).
       const sameIdx = i < current.length ? current[i] : undefined;
       if (
         sameIdx !== undefined &&
@@ -282,6 +281,16 @@ function mergeAssistantBlocks(
       ) {
         const arr = target();
         arr[i] = block;
+        continue;
+      }
+      if (typeof sig === "string" && sig.length > 0) {
+        const dup = current.some(
+          (b) =>
+            isThinkingBlock(b) &&
+            (b as { signature?: unknown }).signature === sig,
+        );
+        if (dup) continue;
+        target().push(block);
         continue;
       }
       // Exact-content match dedupe (replay).
@@ -585,11 +594,109 @@ function reduceStreamPartial(
     && typeof inner.index === "number"
     && state.currentStreamMessageId
   ) {
-    const key = `${state.currentStreamMessageId}:${inner.index}`;
-    if (!state.streamingThinkingText.has(key)) return state;
-    const next = new Map(state.streamingThinkingText);
-    next.delete(key);
-    return { ...state, streamingThinkingText: next };
+    const msgId = state.currentStreamMessageId;
+    const blockIdx = inner.index;
+    const key = `${msgId}:${blockIdx}`;
+
+    // 1. Clear any stale streaming-thinking accumulator entry for this slot.
+    let nextStreamingText = state.streamingThinkingText;
+    if (state.streamingThinkingText.has(key)) {
+      nextStreamingText = new Map(state.streamingThinkingText);
+      nextStreamingText.delete(key);
+    }
+
+    // 2. Synthesize a placeholder assistant message with an empty
+    //    thinking block at `blockIdx` if no real message exists yet.
+    //    Without this, the consolidated `assistant` event doesn't
+    //    arrive until thinking is fully done (often 30 s+), and the
+    //    operator stares at "Awaiting Claude" the whole time even
+    //    though we ARE receiving `thinking_delta` partials.  The
+    //    placeholder makes the in-conversation ThinkingBlock render
+    //    immediately; subsequent deltas flow into
+    //    `streamingThinkingText` and the BlockRenderer's merge logic
+    //    surfaces them in the body in real time.  When the real
+    //    assistant event eventually lands, `mergeAssistantBlocks`
+    //    replaces the empty placeholder at `blockIdx` with the signed
+    //    real block (see the placeholder-replacement branch).
+    let nextMessages = state.messages;
+    let nextThinkingStartedAt = state.thinkingStartedAt;
+    let nextStreamingMessageId = state.streamingMessageId;
+    const existingIdx = state.messages.findIndex(
+      (m) => m.role === "assistant" && m.id === msgId,
+    );
+    if (existingIdx === -1) {
+      const placeholderBlocks: ContentBlock[] = [];
+      // Pad with empty text blocks if the thinking block isn't at
+      // index 0 (rare but possible).  These get replaced by
+      // mergeAssistantBlocks when the real blocks land.
+      for (let i = 0; i < blockIdx; i++) {
+        placeholderBlocks.push({ type: "text", text: "" } as TextBlockData);
+      }
+      placeholderBlocks.push({
+        type: "thinking",
+        thinking: "",
+      } as ThinkingBlockData);
+      const placeholder: RenderedMessage = {
+        id: msgId,
+        role: "assistant",
+        blocks: placeholderBlocks,
+        parentToolUseId: null,
+        timestamp: Date.now(),
+      };
+      nextMessages = [...state.messages, placeholder];
+      nextStreamingMessageId = msgId;
+      if (!state.thinkingStartedAt.has(key)) {
+        nextThinkingStartedAt = new Map(state.thinkingStartedAt).set(
+          key,
+          Date.now(),
+        );
+      }
+    } else {
+      // Message already exists — ensure a thinking block sits at
+      // `blockIdx` and start the timer.
+      const existing = state.messages[existingIdx];
+      const needsBlock =
+        existing.blocks.length <= blockIdx
+        || !isThinkingBlock(existing.blocks[blockIdx]);
+      if (needsBlock) {
+        const newBlocks = existing.blocks.slice();
+        while (newBlocks.length < blockIdx) {
+          newBlocks.push({ type: "text", text: "" } as TextBlockData);
+        }
+        newBlocks[blockIdx] = {
+          type: "thinking",
+          thinking: "",
+        } as ThinkingBlockData;
+        const updated: RenderedMessage = { ...existing, blocks: newBlocks };
+        nextMessages = state.messages.slice();
+        nextMessages[existingIdx] = updated;
+      }
+      if (!state.thinkingStartedAt.has(key)) {
+        nextThinkingStartedAt = new Map(state.thinkingStartedAt).set(
+          key,
+          Date.now(),
+        );
+      }
+      if (state.streamingMessageId !== msgId) {
+        nextStreamingMessageId = msgId;
+      }
+    }
+
+    if (
+      nextStreamingText === state.streamingThinkingText
+      && nextMessages === state.messages
+      && nextThinkingStartedAt === state.thinkingStartedAt
+      && nextStreamingMessageId === state.streamingMessageId
+    ) {
+      return state;
+    }
+    return {
+      ...state,
+      streamingThinkingText: nextStreamingText,
+      messages: nextMessages,
+      thinkingStartedAt: nextThinkingStartedAt,
+      streamingMessageId: nextStreamingMessageId,
+    };
   }
 
   if (
@@ -803,6 +910,13 @@ export function reduceEvent(
           const v = u?.output_tokens;
           return typeof v === "number" ? v : 0;
         })();
+    const turnIn = alreadyAccumulated
+      ? 0
+      : (() => {
+          const u = (event as { usage?: { input_tokens?: unknown } }).usage;
+          const v = u?.input_tokens;
+          return typeof v === "number" ? v : 0;
+        })();
     const seenResultEventIds =
       eventId !== null && !alreadyAccumulated
         ? appendCappedResultId(state.seenResultEventIds, eventId)
@@ -817,10 +931,17 @@ export function reduceEvent(
       resultEventAt: now,
       seenResultEventIds,
       cumulativeCostUsd: state.cumulativeCostUsd + turnCost,
+      cumulativeInputTokens: state.cumulativeInputTokens + turnIn,
       cumulativeOutputTokens: state.cumulativeOutputTokens + turnOut,
+      // A SUCCESSFUL result clears any prior error — once the user has
+      // recovered (via /compact, /branch, a fork, etc.) the banner
+      // should disappear.  Mid-turn events (assistant deltas, tool
+      // results) leave `lastError` untouched so the banner stays put
+      // until the next FULL turn lands; the result event itself is
+      // what gates banner visibility via `selectFatalError`.
       lastError: event.is_error
         ? event.result ?? `Agent returned ${event.subtype}`
-        : state.lastError,
+        : null,
       streamingMessageId: null,
       runningToolUseIds:
         state.runningToolUseIds.size === 0
